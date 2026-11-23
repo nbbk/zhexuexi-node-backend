@@ -27,10 +27,17 @@ type supervisor struct {
 	maxQuickExits   int
 	backoffDelay    time.Duration
 
-	mu          sync.Mutex
-	cmd         *exec.Cmd
-	running     bool
-	stopping    bool
+	mu       sync.Mutex
+	cmd      *exec.Cmd
+	running  bool
+	stopping bool
+	// watching reports whether a watch loop is alive. Start() must
+	// not spawn a second watch loop while one is alive (e.g. while
+	// it is backing off after quick exits): the live loop owns
+	// restarts, and a second loop would start a second Xray. Start()
+	// after Stop() is not supported: the supervisor is single-use
+	// once stopped (runAgent never restarts one).
+	watching    bool
 	startedAt   time.Time
 	pid         int
 	restarts    int
@@ -54,17 +61,23 @@ func newSupervisor(xrayPath, configPath string) *supervisor {
 }
 
 // Start launches Xray once and starts the watch loop. A second call is
-// a no-op (use Restart to bounce a running process).
+// a no-op (use Restart to bounce a running process), as is a call
+// while a watch loop is already alive: the live loop owns restarts,
+// including after a crash and during backoff.
 func (s *supervisor) Start() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.running {
+	if s.running || s.watching {
+		// A live watch loop restarts the child itself; if it was
+		// stopped, un-stop it so the loop brings the child back.
+		s.stopping = false
 		return nil
 	}
 	s.stopping = false
 	if err := s.startLocked(); err != nil {
 		return err
 	}
+	s.watching = true
 	s.watchDone = make(chan struct{})
 	go s.watch()
 	return nil
@@ -95,6 +108,11 @@ func (s *supervisor) startLocked() error {
 // called. It runs until the supervisor is stopped.
 func (s *supervisor) watch() {
 	defer close(s.watchDone)
+	defer func() {
+		s.mu.Lock()
+		s.watching = false
+		s.mu.Unlock()
+	}()
 	for {
 		s.mu.Lock()
 		cmd := s.cmd

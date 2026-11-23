@@ -94,6 +94,10 @@ func (c *controlServer) handleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleReload POST /reload: pull the panel config now and apply it.
+// A successful reload already ensures Xray is running (304 and
+// SHA-identical applies both start it); the check below covers a
+// reload func that applied nothing (e.g. the panel was unreachable
+// on a previous cycle and the stub path skipped the apply).
 func (c *controlServer) handleReload(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeControlJSON(w, http.StatusMethodNotAllowed, map[string]any{"ok": false, "error": "method not allowed"})
@@ -103,16 +107,29 @@ func (c *controlServer) handleReload(w http.ResponseWriter, r *http.Request) {
 		writeControlJSON(w, http.StatusInternalServerError, map[string]any{"ok": false, "error": err.Error()})
 		return
 	}
+	if !c.sup.IsRunning() {
+		if err := c.sup.Start(); err != nil {
+			writeControlJSON(w, http.StatusInternalServerError, map[string]any{"ok": false, "error": "reload ok but xray failed to start: " + err.Error()})
+			return
+		}
+	}
 	writeControlJSON(w, http.StatusOK, map[string]any{"ok": true, "config_version": c.configVersion()})
 }
 
 // handleRestartCore POST /restart-core: bounce the Xray child process.
+// When Xray is not running there is nothing to bounce, so start it
+// instead (0.1.2 returned "xray is not running" and left the node down).
 func (c *controlServer) handleRestartCore(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeControlJSON(w, http.StatusMethodNotAllowed, map[string]any{"ok": false, "error": "method not allowed"})
 		return
 	}
-	if err := c.sup.Restart(); err != nil {
+	if !c.sup.IsRunning() {
+		if err := c.sup.Start(); err != nil {
+			writeControlJSON(w, http.StatusInternalServerError, map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
+	} else if err := c.sup.Restart(); err != nil {
 		writeControlJSON(w, http.StatusInternalServerError, map[string]any{"ok": false, "error": err.Error()})
 		return
 	}

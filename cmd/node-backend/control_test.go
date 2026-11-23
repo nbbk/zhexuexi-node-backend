@@ -139,6 +139,53 @@ func TestControlRestartCore(t *testing.T) {
 	}
 }
 
+// TestControlRestartCoreStartsStopped: POST /restart-core with Xray
+// down must start it (0.1.2 returned "xray is not running").
+func TestControlRestartCoreStartsStopped(t *testing.T) {
+	bin := fakeBinary(t, "sleep 300")
+	sup := newSupervisor(bin, filepath.Join(t.TempDir(), "xray.json"))
+	t.Cleanup(sup.Stop)
+	cs, err := newControlServer("127.0.0.1:0", sup, func() error { return nil }, func() int { return 0 })
+	if err != nil {
+		t.Fatalf("newControlServer: %v", err)
+	}
+	addr, err := cs.Start()
+	if err != nil {
+		t.Fatalf("control Start: %v", err)
+	}
+	t.Cleanup(cs.Stop)
+	if sup.IsRunning() {
+		t.Fatalf("supervisor should start stopped")
+	}
+	code, m := postEmpty(t, "http://"+addr+"/restart-core")
+	if code != http.StatusOK || m["ok"] != true {
+		t.Fatalf("restart-core status = %d body %v, want 200 ok", code, m)
+	}
+	waitFor(t, 5*time.Second, "xray to start via restart-core", sup.IsRunning)
+}
+
+// TestControlReloadStartsStopped: POST /reload with Xray down must
+// leave it running after the reload.
+func TestControlReloadStartsStopped(t *testing.T) {
+	bin := fakeBinary(t, "sleep 300")
+	sup := newSupervisor(bin, filepath.Join(t.TempDir(), "xray.json"))
+	t.Cleanup(sup.Stop)
+	cs, err := newControlServer("127.0.0.1:0", sup, func() error { return nil }, func() int { return 0 })
+	if err != nil {
+		t.Fatalf("newControlServer: %v", err)
+	}
+	addr, err := cs.Start()
+	if err != nil {
+		t.Fatalf("control Start: %v", err)
+	}
+	t.Cleanup(cs.Stop)
+	code, m := postEmpty(t, "http://"+addr+"/reload")
+	if code != http.StatusOK || m["ok"] != true {
+		t.Fatalf("reload status = %d body %v, want 200 ok", code, m)
+	}
+	waitFor(t, 5*time.Second, "xray to start via reload", sup.IsRunning)
+}
+
 // TestControlMethodNotAllowed: GET on a POST endpoint is 405.
 func TestControlMethodNotAllowed(t *testing.T) {
 	_, addr, _, _ := testControl(t)

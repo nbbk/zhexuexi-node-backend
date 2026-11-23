@@ -3,9 +3,9 @@
 轻量节点后端 agent：跑在落地机上的静态 Go 二进制。面板是唯一的事实
 来源；agent 只做节点拉取（60 秒 ETag），不做面板推送。
 
-切片 2（v0.1.1）：agent 渲染 Xray 配置、监管 Xray 子进程
-（REALITY＋Vision、REALITY＋XHTTP 服务端、回环控制接口）。
-sing-box 核心监管是后续切片的事，本版不含。
+切片 3（v0.1.3）：用户热同步（`AlterInbound`，不重启 Xray）＋启动
+bug 修复（SHA 一致／304／`/reload`／`/restart-core` 时 Xray 没跑就
+起）。sing-box 核心监管是后续切片的事，本版不含。
 
 ## 安装
 
@@ -36,18 +36,18 @@ DRY_RUN=1 ./install-node-backend.sh --panel https://example.com:11111 \
 ```
 
 安装脚本优先从 GitHub Release 下二进制
-（`releases/download/v0.1.2/node-backend-<amd64|arm64>`），下不到则
+（`releases/download/v0.1.3/node-backend-<amd64|arm64>`），下不到则
 改走源码编译兜底（`git clone` 仓库，缺 Go 时下载 Go 1.22.2 装到
 `/usr/local/go`，`CGO_ENABLED=0 go build`）。
 
-> 注意：v0.1.2 的 Release 在推仓后才建，当前下载主路径会 404，
+> 注意：v0.1.3 的 Release 在推仓后才建，当前下载主路径会 404，
 > 这是预期的；此时脚本会自动走源码编译兜底。
 
 ## 子命令
 
 ```bash
 node-backend version
-# node-backend 0.1.2
+# node-backend 0.1.3
 
 node-backend join --panel https://example.com:11111 \
   --token join_11111111111111111111111111111111 --node-id 1
@@ -71,11 +71,16 @@ node-backend run [--config-dir DIR] [--state-dir DIR]
 
 读配置，立即拉一次配置，之后每 60 秒拉一次
 （`GET /api/v1/node/config`，mTLS 出示入网证书，带
-`If-None-Match` 与 `X-Node-Backend-Version: 0.1.2`）：
+`If-None-Match` 与 `X-Node-Backend-Version: 0.1.3`）：
 
 - 200 非删除：把 `config_version` / `etag` / `last_pull` 写状态文件，
   再把配置渲染成 Xray 配置并应用（见下）；
-- 304：什么都不做；
+- 304：配置没变，但 agent 仍要确保 Xray 在跑（0.1.3 修启动 bug：
+  agent／服务器重启后第一次拉取常是 304，旧版直接返回、Xray
+  永远不起来）；同时从磁盘 `xray.json` 恢复已应用的用户集。
+  若 304 时 Xray 是刚起来的（之前没跑），磁盘配置可能落后于
+  热应用过的用户变更，agent 会强制再拉一次全量配置补齐差量，
+  删掉的用户重启后也连不上；
 - 200 且 `deleted: true`：停 Xray，记一条日志，exit(0) 自停
   （systemd `Restart=on-failure` 不重启正常退出）；
 - 拉取出错（连不上、非 2xx/304）：记日志，下个周期再试，不退出；
@@ -94,9 +99,32 @@ node-backend run [--config-dir DIR] [--state-dir DIR]
   TLS 入站没证书时报错（证书是切片 7 的事）。
   渲染前先 `xray run -test` 校验，校验不过不应用。
 - 监管：Xray 子进程被 kill 后 5 秒内拉起；连续 3 次 10 秒内退出
-  则退避 60 秒并记最近错误。
+  则退避 60 秒并记最近错误。`Start()` 在看护循环活着时是 no-op
+  （看护循环自己负责重启，避免双 Xray）；`Stop()` 后的 supervisor
+  不再复用。
 - 控制接口（只绑回环）：`GET /health`、`POST /reload`（立即拉一次）、
-  `POST /restart-core`，默认 `127.0.0.1:18081`。
+  `POST /restart-core`，默认 `127.0.0.1:18081`。`/reload` 与
+  `/restart-core` 在 Xray 没跑时先把它起起来，而不是报错。
+
+### 用户热同步（切片 3，AlterInbound）
+
+- 只变用户（新增／删除／轮换 UUID）时不写文件、不重启 Xray：
+  agent 比较新旧用户集（按 email），差量走 Xray gRPC API 热应用。
+- 实现走 Xray 自带的 `xray api adu` / `xray api rmu` 子命令（与
+  supervisor 用同一个二进制）：`adu` 一次加一个入站的全部新增
+  用户（`{"inbounds": [{tag, port, protocol, settings: {clients,
+  decryption}}]}`，0600 临时文件、用后删除），`rmu` 一次删一个
+  入站的全部待删 email；不引入 grpc／protobuf 依赖，agent 保持
+  纯标准库静态二进制。`adu` 按 `Added N user(s) in total` 校验
+  个数；API 不通时子命令非零退出，agent 记日志并回退到重写＋
+  重启，保证最终一致。
+- 结构判断：比较新旧渲染时忽略用户列表（渲染结果去掉各 VLESS
+  入站的 `clients` 再算 SHA）；只有用户变了才走热应用，入站
+  结构／端口／REALITY 等变了照旧重写＋重启（用户随新配置一起进）。
+- 已应用的用户集存在内存里（以最后一次成功应用的配置为准）；
+  agent 重启后从磁盘 `xray.json` 里渲染的用户集恢复。
+- 每个 VLESS 入站都应用：REALITY 入站的用户带该入站的 flow
+  （`xtls-rprx-vision`），XHTTP 入站的用户不带 flow。
 
 ### 变量原则：随部署变化的值走配置，不写死
 
@@ -121,10 +149,12 @@ cmd/node-backend/    agent 源码（只用标准库，无第三方依赖）
   run.go             60 秒轮询、状态文件与配置应用
   config.go          配置读写（0600，原子写）与默认值
   xray.go            Xray 配置渲染与校验（REALITY／XHTTP）
+  alter.go           用户差量与 AlterInbound（`xray api adu`／`rmu`）
   supervisor.go      Xray 子进程监管（拉起、看护、重启、退避）
   control.go         回环控制接口（/health、/reload、/restart-core）
   main_test.go       测试（httptest 桩面板，含 mTLS 端到端）
   xray_test.go       测试（渲染、校验、配置默认值）
+  alter_test.go      测试（用户差量、热应用、启动修复、304）
   supervisor_test.go 测试（kill 后拉起、崩溃退避、停止）
   control_test.go    测试（健康、重载、重启核心、回环校验）
 node-backend.service systemd 单元
