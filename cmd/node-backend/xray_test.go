@@ -102,11 +102,14 @@ func strMap(t *testing.T, v any) map[string]any {
 
 // TestRenderRealityInbound: the default trio renders api + reality +
 // xhttp; hy2 is skipped (sing-box core, later slice). REALITY carries
-// minClientVer pinned to the core version, and Vision flow on clients.
+// no minClientVer (0.1.2), and Vision flow on clients.
 func TestRenderRealityInbound(t *testing.T) {
 	data, sha, skipped, err := renderXrayConfig(testRealityDoc(), 10085)
 	if err != nil {
 		t.Fatalf("renderXrayConfig: %v", err)
+	}
+	if strings.Contains(string(data), "minClientVer") {
+		t.Fatalf("rendered config must not contain minClientVer")
 	}
 	if sha == "" {
 		t.Fatalf("empty config sha")
@@ -134,8 +137,8 @@ func TestRenderRealityInbound(t *testing.T) {
 		t.Fatalf("reality streamSettings wrong: %v", ss)
 	}
 	rs := strMap(t, ss["realitySettings"])
-	if rs["minClientVer"] != xrayMinClientVer {
-		t.Fatalf("minClientVer = %v, want %q", rs["minClientVer"], xrayMinClientVer)
+	if _, hasMin := rs["minClientVer"]; hasMin {
+		t.Fatalf("reality must not render minClientVer, got %v", rs["minClientVer"])
 	}
 	if rs["dest"] != "www.example.com:443" {
 		t.Fatalf("dest = %v, want www.example.com:443", rs["dest"])
@@ -168,8 +171,8 @@ func TestRenderRealityInbound(t *testing.T) {
 		t.Fatalf("xhttp streamSettings wrong: %v", xss)
 	}
 	xrs := strMap(t, xss["realitySettings"])
-	if xrs["minClientVer"] != xrayMinClientVer {
-		t.Fatalf("xhttp minClientVer = %v, want %q", xrs["minClientVer"], xrayMinClientVer)
+	if _, hasMin := xrs["minClientVer"]; hasMin {
+		t.Fatalf("xhttp must not render minClientVer, got %v", xrs["minClientVer"])
 	}
 	xclients, _ := strMap(t, xhttp["settings"])["clients"].([]any)
 	if len(xclients) != 2 {

@@ -13,14 +13,8 @@ import (
 )
 
 // XrayVersion is the pinned Xray-core version (build plan §2, §15.2):
-// the install script downloads exactly this release, and the rendered
-// config pins minClientVer to it.
+// the install script downloads exactly this release.
 const XrayVersion = "26.11.9"
-
-// xrayMinClientVer is written explicitly into every REALITY inbound
-// (build plan §12 slice 2): clients older than the pinned core are
-// refused. It tracks XrayVersion; bump both together.
-const xrayMinClientVer = "26.11.9"
 
 // defaultXrayPath is where the install script puts the Xray binary.
 const defaultXrayPath = "/usr/local/bin/xray"
@@ -264,8 +258,10 @@ func renderVLESSInbound(in configInbound, users []map[string]any) (*xrayInbound,
 	}
 }
 
-// realitySettings builds the REALITY server block. minClientVer is
-// written explicitly and pinned to the core version (XrayVersion).
+// realitySettings builds the REALITY server block. No minClientVer
+// is written (0.1.2): third-party clients report versions that do
+// not compare against the Xray core version, and pinning it refused
+// them (Shadowrocket 2.2.93 on the pilot node).
 func realitySettings(in configInbound) (map[string]any, error) {
 	if strings.TrimSpace(in.RealityPrivateKey) == "" {
 		return nil, fmt.Errorf("missing reality private key")
@@ -291,13 +287,12 @@ func realitySettings(in configInbound) (map[string]any, error) {
 		dest = "www.example.com:443"
 	}
 	return map[string]any{
-		"show":         false,
-		"dest":         dest,
-		"xver":         0,
-		"serverNames":  names,
-		"privateKey":   in.RealityPrivateKey,
-		"minClientVer": xrayMinClientVer,
-		"shortIds":     []string{in.RealityShortID},
+		"show":        false,
+		"dest":        dest,
+		"xver":        0,
+		"serverNames": names,
+		"privateKey":  in.RealityPrivateKey,
+		"shortIds":    []string{in.RealityShortID},
 	}, nil
 }
 

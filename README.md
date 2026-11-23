@@ -36,18 +36,18 @@ DRY_RUN=1 ./install-node-backend.sh --panel https://example.com:11111 \
 ```
 
 安装脚本优先从 GitHub Release 下二进制
-（`releases/download/v0.1.1/node-backend-<amd64|arm64>`），下不到则
+（`releases/download/v0.1.2/node-backend-<amd64|arm64>`），下不到则
 改走源码编译兜底（`git clone` 仓库，缺 Go 时下载 Go 1.22.2 装到
 `/usr/local/go`，`CGO_ENABLED=0 go build`）。
 
-> 注意：v0.1.1 的 Release 在推仓后才建，当前下载主路径会 404，
+> 注意：v0.1.2 的 Release 在推仓后才建，当前下载主路径会 404，
 > 这是预期的；此时脚本会自动走源码编译兜底。
 
 ## 子命令
 
 ```bash
 node-backend version
-# node-backend 0.1.1
+# node-backend 0.1.2
 
 node-backend join --panel https://example.com:11111 \
   --token join_11111111111111111111111111111111 --node-id 1
@@ -71,7 +71,7 @@ node-backend run [--config-dir DIR] [--state-dir DIR]
 
 读配置，立即拉一次配置，之后每 60 秒拉一次
 （`GET /api/v1/node/config`，mTLS 出示入网证书，带
-`If-None-Match` 与 `X-Node-Backend-Version: 0.1.1`）：
+`If-None-Match` 与 `X-Node-Backend-Version: 0.1.2`）：
 
 - 200 非删除：把 `config_version` / `etag` / `last_pull` 写状态文件，
   再把配置渲染成 Xray 配置并应用（见下）；
@@ -89,7 +89,7 @@ node-backend run [--config-dir DIR] [--state-dir DIR]
 - 渲染：面板入站 → Xray 配置（`<config-dir>/xray.json`，0600）。
   VLESS＋REALITY（＋Vision）、VLESS＋REALITY＋XHTTP（服务端）、
   api／stats／policy／dokodemo-door（127.0.0.1:10085）；
-  REALITY 入站显式写 `minClientVer`（钉死 v26.11.9）；
+  REALITY 入站不写 `minClientVer`（第三方客户端版本不受限，0.1.2）；
   HY2／TUIC 等非 Xray 入站跳过不渲染（sing-box 核心是后续切片的事）；
   TLS 入站没证书时报错（证书是切片 7 的事）。
   渲染前先 `xray run -test` 校验，校验不过不应用。
