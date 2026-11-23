@@ -10,17 +10,54 @@ import (
 	"time"
 )
 
-// nodeConfig is the body of GET /api/v1/node/config. Inbounds, users and
-// certs are kept as raw JSON in slice 1: the agent only needs version,
-// etag and the deleted flag here; applying the contents is slice 2 work.
+// configInbound is one inbound from GET /api/v1/node/config. Field
+// names match the panel's NodeInbound JSON (panel/node_backend.go).
+type configInbound struct {
+	NodeID             int64  `json:"node_id"`
+	InboundID          int64  `json:"inbound_id"`
+	InboundTag         string `json:"inbound_tag"`
+	Protocol           string `json:"protocol"`
+	Transport          string `json:"transport"`
+	Security           string `json:"security"`
+	Port               int    `json:"port"`
+	Listen             string `json:"listen"`
+	SNI                string `json:"sni"`
+	Domain             string `json:"domain"`
+	RealityPrivateKey  string `json:"reality_private_key"`
+	RealityPublicKey   string `json:"reality_public_key"`
+	RealityShortID     string `json:"reality_short_id"`
+	RealityDest        string `json:"reality_dest"`
+	RealityServerName  string `json:"reality_server_names"`
+	RealityFingerprint string `json:"reality_fingerprint"`
+	CertRef            int64  `json:"cert_ref"`
+	Flow               string `json:"flow"`
+	SSMethod           string `json:"ss_method"`
+	SSPassword         string `json:"ss_password"`
+	Enabled            bool   `json:"enabled"`
+}
+
+// configUser is one user from GET /api/v1/node/config. VLESSUUID is
+// this user's UUID on this node; Email is the Xray user>>> stats key.
+type configUser struct {
+	UserID    string `json:"user_id"`
+	Kind      string `json:"kind"`
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	Email     string `json:"email"`
+	VLESSUUID string `json:"vless_uuid"`
+	Disabled  bool   `json:"disabled"`
+}
+
+// nodeConfig is the body of GET /api/v1/node/config. Certs stay raw
+// JSON in slice 2: certificate issue and delivery is slice 7 work.
 type nodeConfig struct {
 	OK            bool              `json:"ok"`
 	NodeID        int               `json:"node_id"`
 	ConfigVersion int               `json:"config_version"`
 	ETag          string            `json:"etag"`
 	Deleted       bool              `json:"deleted"`
-	Inbounds      []json.RawMessage `json:"inbounds"`
-	Users         []json.RawMessage `json:"users"`
+	Inbounds      []configInbound   `json:"inbounds"`
+	Users         []configUser      `json:"users"`
 	Certs         []json.RawMessage `json:"certs"`
 	Error         string            `json:"error"`
 }

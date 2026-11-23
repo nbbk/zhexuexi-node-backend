@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Install zhexuexi node-backend agent 0.1.0 on a landing (node) machine.
-# Installs the agent only; no Xray/sing-box core in slice 1.
+# Install zhexuexi node-backend agent 0.1.1 on a landing (node) machine.
+# Installs the agent + the pinned Xray-core v26.11.9 (slice 2); the
+# agent supervises Xray and renders its config from the panel.
 #
 # Usage:
 #   install-node-backend.sh --panel https://example.com:11111 \
@@ -10,14 +11,17 @@
 #       dry run: only prints what would be done, changes nothing.
 #
 # Steps: detect arch -> download release binary (fallback: build from
-# source) -> install binary + systemd unit -> daemon-reload + enable ->
-# join the panel -> start the service -> self-check.
+# source) -> download Xray-core v26.11.9 -> install binary + systemd
+# unit -> daemon-reload + enable -> join the panel -> start the
+# service -> self-check.
 set -euo pipefail
 
-VERSION="0.1.0"
+VERSION="0.1.1"
+XRAY_VERSION="26.11.9"
 REPO="nbbk/zhexuexi-node-backend"
 BIN_NAME="node-backend"
 BIN_PATH="/usr/local/bin/node-backend"
+XRAY_PATH="/usr/local/bin/xray"
 UNIT_PATH="/etc/systemd/system/node-backend.service"
 CONFIG_DIR="/etc/node-backend"
 STATE_DIR="/var/lib/node-backend"
@@ -57,6 +61,12 @@ esac
 
 RELEASE_URL="https://github.com/${REPO}/releases/download/v${VERSION}/${BIN_NAME}-${GOARCH}"
 GO_VERSION="1.22.2"
+# Xray-core release asset per arch (pinned v26.11.9, build plan §2).
+case "$GOARCH" in
+  amd64) XRAY_ASSET="Xray-linux-64.zip" ;;
+  arm64) XRAY_ASSET="Xray-linux-arm64-v8a.zip" ;;
+esac
+XRAY_URL="https://github.com/XTLS/Xray-core/releases/download/v${XRAY_VERSION}/${XRAY_ASSET}"
 
 run() {
   # run <description> <command...>: in dry-run mode print, else execute.
@@ -108,6 +118,24 @@ else
     chmod 755 "$TMP_BIN"
   fi
   install -m 755 "$TMP_BIN" "$BIN_PATH"
+fi
+
+# 1b. Download Xray-core v${XRAY_VERSION} (pinned, build plan §2).
+# Skip when the installed binary already reports this version.
+if [ "$DRY_RUN" = "1" ]; then
+  echo "[dry-run] download Xray-core v${XRAY_VERSION} (${XRAY_ASSET}) -> ${XRAY_PATH}"
+else
+  if [ -x "$XRAY_PATH" ] && "$XRAY_PATH" version 2>/dev/null | grep -q "Xray ${XRAY_VERSION}"; then
+    echo "Xray-core v${XRAY_VERSION} already installed, skipping"
+  else
+    echo "==> downloading Xray-core v${XRAY_VERSION} (${XRAY_ASSET})"
+    TMP_XRAY="$(mktemp -d)"
+    curl -fsSL -o "${TMP_XRAY}/xray.zip" "$XRAY_URL"
+    (cd "$TMP_XRAY" && unzip -o -q xray.zip xray)
+    install -m 755 "${TMP_XRAY}/xray" "$XRAY_PATH"
+    rm -rf "$TMP_XRAY"
+    echo "Xray-core installed: $("$XRAY_PATH" version | head -1)"
+  fi
 fi
 
 # 2. Install the systemd unit. Prefer the copy shipped next to this

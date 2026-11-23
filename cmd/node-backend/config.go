@@ -15,12 +15,46 @@ const DefaultStateDir = "/var/lib/node-backend"
 
 // Config is the agent configuration written by `join` and read by `run`.
 // It is stored at <config-dir>/config.json with mode 0600.
+//
+// Slice 2 fields (XrayPath, XrayConfigPath, ControlAddr, APIPort) are
+// optional in the file: loadConfig fills the defaults below, so a
+// config written by agent 0.1.0 keeps working after upgrade.
 type Config struct {
 	PanelURL string `json:"panel_url"`
 	NodeID   int    `json:"node_id"`
 	CertFile string `json:"cert_file"`
 	KeyFile  string `json:"key_file"`
 	Insecure bool   `json:"insecure"`
+	// XrayPath is the Xray-core binary (slice 2). Empty = default.
+	XrayPath string `json:"xray_path,omitempty"`
+	// XrayConfigPath is where the agent writes the rendered Xray config
+	// (slice 2). Empty = <config-dir>/xray.json.
+	XrayConfigPath string `json:"xray_config_path,omitempty"`
+	// ControlAddr is the loopback control API listen address (slice 2).
+	// Only 127.0.0.1 / ::1 are accepted; anything else refuses to start.
+	ControlAddr string `json:"control_addr,omitempty"`
+	// APIPort is the Xray gRPC API port on 127.0.0.1 (slice 2).
+	// 0 = defaultAPIPort.
+	APIPort int `json:"api_port,omitempty"`
+}
+
+// defaultControlAddr is the loopback control API address.
+const defaultControlAddr = "127.0.0.1:18081"
+
+// applyDefaults fills slice-2 fields that an older config file lacks.
+func (c *Config) applyDefaults(configDir string) {
+	if c.XrayPath == "" {
+		c.XrayPath = defaultXrayPath
+	}
+	if c.XrayConfigPath == "" {
+		c.XrayConfigPath = filepath.Join(configDir, "xray.json")
+	}
+	if c.ControlAddr == "" {
+		c.ControlAddr = defaultControlAddr
+	}
+	if c.APIPort == 0 {
+		c.APIPort = defaultAPIPort
+	}
 }
 
 // certFilePath returns the client certificate path for a config dir.
@@ -46,6 +80,7 @@ func loadConfig(configDir string) (*Config, error) {
 	if cfg.PanelURL == "" || cfg.NodeID == 0 || cfg.CertFile == "" || cfg.KeyFile == "" {
 		return nil, fmt.Errorf("config incomplete: panel_url, node_id, cert_file and key_file are all required")
 	}
+	cfg.applyDefaults(configDir)
 	return &cfg, nil
 }
 
