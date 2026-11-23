@@ -1,0 +1,15 @@
+[Unit]
+Description=zhexuexi node backend agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/node-backend run
+Restart=on-failure
+RestartSec=10s
+# The agent exits 0 on its own when the panel deletes the node;
+# Restart=on-failure does not restart a clean exit.
+
+[Install]
+WantedBy=multi-user.target
