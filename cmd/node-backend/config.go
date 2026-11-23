@@ -36,6 +36,9 @@ type Config struct {
 	// APIPort is the Xray gRPC API port on 127.0.0.1 (slice 2).
 	// 0 = defaultAPIPort.
 	APIPort int `json:"api_port,omitempty"`
+	// SpoolPath is where unconfirmed traffic windows are queued
+	// (slice 4). Empty = <config-dir>/spool.json.
+	SpoolPath string `json:"spool_path,omitempty"`
 }
 
 // defaultControlAddr is the loopback control API address.
@@ -54,6 +57,9 @@ func (c *Config) applyDefaults(configDir string) {
 	}
 	if c.APIPort == 0 {
 		c.APIPort = defaultAPIPort
+	}
+	if c.SpoolPath == "" {
+		c.SpoolPath = filepath.Join(configDir, "spool.json")
 	}
 }
 

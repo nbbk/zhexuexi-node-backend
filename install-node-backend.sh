@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install zhexuexi node-backend agent 0.1.3 on a landing (node) machine.
+# Install zhexuexi node-backend agent 0.1.4 on a landing (node) machine.
 # Installs the agent + the pinned Xray-core v26.11.9 (slice 2); the
 # agent supervises Xray and renders its config from the panel.
 #
@@ -16,7 +16,7 @@
 # service -> self-check.
 set -euo pipefail
 
-VERSION="0.1.3"
+VERSION="0.1.4"
 XRAY_VERSION="26.11.9"
 REPO="nbbk/zhexuexi-node-backend"
 BIN_NAME="node-backend"

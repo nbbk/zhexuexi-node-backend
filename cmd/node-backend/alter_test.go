@@ -128,13 +128,21 @@ func TestUsersAndStructureFromRendered(t *testing.T) {
 	if err != nil {
 		t.Fatalf("render: %v", err)
 	}
-	users, structure, err := usersAndStructureFromRendered(data)
+	users, byInbound, structure, err := usersAndStructureFromRendered(data)
 	if err != nil {
 		t.Fatalf("seed parse: %v", err)
 	}
 	if len(users) != 2 || users["u-sub-su-1@node"].VLESSUUID != "11111111-2222-3333-4444-555555555555" ||
 		users["u-merged-ms-1@node"].VLESSUUID != "22222222-3333-4444-5555-666666666666" {
 		t.Fatalf("seeded users = %v, want the two rendered users", users)
+	}
+	// Slice 4: the disk seed also splits users per inbound (both
+	// users are assigned to both VLESS inbounds here).
+	if len(byInbound) != 2 || len(byInbound["reality-443"]) != 2 || len(byInbound["xhttp-443"]) != 2 {
+		t.Fatalf("seeded per-inbound users = %v, want 2 users in each of reality-443 and xhttp-443", byInbound)
+	}
+	if byInbound["reality-443"]["u-sub-su-1@node"].VLESSUUID != "11111111-2222-3333-4444-555555555555" {
+		t.Fatalf("seeded reality-443 users wrong: %v", byInbound["reality-443"])
 	}
 	noUsers := &nodeConfig{OK: true, NodeID: 1, ConfigVersion: 2, Inbounds: doc.Inbounds}
 	emptyData, _, _, err := renderXrayConfig(noUsers, 10085)
@@ -228,12 +236,27 @@ func TestApplyUsersOnlyHotPath(t *testing.T) {
 	if pid := sup.Status().PID; pid != pid1 {
 		t.Fatalf("user-only change restarted xray: %d -> %d", pid1, pid)
 	}
+	// Slice 4: a hot apply now also writes the rendered config to
+	// disk, so the disk file agrees with the running Xray (the
+	// 0.1.3 bug was exactly that it did not). The file must now
+	// carry the new user and the rotated UUID.
 	after, err := os.ReadFile(cfg.XrayConfigPath)
 	if err != nil {
 		t.Fatalf("read xray.json after: %v", err)
 	}
-	if string(before) != string(after) {
-		t.Fatalf("user-only change rewrote xray.json")
+	if string(before) == string(after) {
+		t.Fatalf("user-only change left xray.json untouched; disk must follow the hot apply")
+	}
+	if !strings.Contains(string(after), "33333333-4444-5555-6666-777777777777") ||
+		!strings.Contains(string(after), "99999999-8888-7777-6666-555555555555") {
+		t.Fatalf("xray.json after hot apply lacks the new/rotated user:\n%s", string(after))
+	}
+	want, _, _, err := renderXrayConfig(doc3, 10086)
+	if err != nil {
+		t.Fatalf("render doc3: %v", err)
+	}
+	if string(after) != string(want) {
+		t.Fatalf("xray.json after hot apply is not the fresh render of the new config")
 	}
 	if ap.appliedVersion() != 3 {
 		t.Fatalf("applied version = %d, want 3", ap.appliedVersion())
@@ -420,7 +443,10 @@ func TestPull304RestartsStaleDiskResyncsUsers(t *testing.T) {
 	}
 	// The re-sync must hot-apply the user drift (rotate B, add C),
 	// not restart Xray: one remove call and one add call per
-	// inbound, no file rewrite.
+	// inbound. Slice 4: the hot apply also writes the rendered
+	// config to disk, so the disk file now carries the v4 users
+	// instead of the stale v2 set (that write is what stops the
+	// 0.1.3 stale-disk class of bug from recurring).
 	if len(fake.removes) != 2 || len(fake.adds) != 2 {
 		t.Fatalf("alter calls: removes=%d adds=%d, want 2 and 2", len(fake.removes), len(fake.adds))
 	}
@@ -444,8 +470,12 @@ func TestPull304RestartsStaleDiskResyncsUsers(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read xray.json: %v", err)
 	}
-	if string(after) != string(diskData) {
-		t.Fatalf("re-sync rewrote xray.json; hot apply must not")
+	if string(after) == string(diskData) {
+		t.Fatalf("re-sync hot apply left xray.json at the stale v2 set; disk must follow the hot apply")
+	}
+	if !strings.Contains(string(after), "33333333-4444-5555-6666-777777777777") ||
+		!strings.Contains(string(after), "99999999-8888-7777-6666-555555555555") {
+		t.Fatalf("xray.json after re-sync lacks the v4 users:\n%s", string(after))
 	}
 }
 func TestPull304EnsuresXray(t *testing.T) {

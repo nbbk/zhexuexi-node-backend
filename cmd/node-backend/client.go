@@ -1,12 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -38,14 +40,17 @@ type configInbound struct {
 
 // configUser is one user from GET /api/v1/node/config. VLESSUUID is
 // this user's UUID on this node; Email is the Xray user>>> stats key.
+// Inbounds (slice 4) is the per-inbound assignment: the tags of the
+// inbounds this user may use. Missing or empty means all inbounds.
 type configUser struct {
-	UserID    string `json:"user_id"`
-	Kind      string `json:"kind"`
-	ID        string `json:"id"`
-	Name      string `json:"name"`
-	Email     string `json:"email"`
-	VLESSUUID string `json:"vless_uuid"`
-	Disabled  bool   `json:"disabled"`
+	UserID    string   `json:"user_id"`
+	Kind      string   `json:"kind"`
+	ID        string   `json:"id"`
+	Name      string   `json:"name"`
+	Email     string   `json:"email"`
+	VLESSUUID string   `json:"vless_uuid"`
+	Disabled  bool     `json:"disabled"`
+	Inbounds  []string `json:"inbounds,omitempty"`
 }
 
 // nodeConfig is the body of GET /api/v1/node/config. Certs stay raw
@@ -94,6 +99,62 @@ func newHTTPClient(cfg *Config, rootCAs *x509.CertPool) (*http.Client, error) {
 		Transport: &http.Transport{TLSClientConfig: tlsCfg},
 		Timeout:   30 * time.Second,
 	}, nil
+}
+
+// userKey is the panel's kind:id identity for a user, used as the
+// user_key in traffic reports. It comes from the pulled config's
+// user_id field ("subuser:su-1" / "merged:ms-1"); when the field is
+// absent it is derived from the Xray email, whose format is the one
+// the panel actually emits (u-sub-<id>@node / u-merged-<id>@node,
+// not the build plan's user-<id>@panel example).
+func userKey(u configUser) string {
+	if strings.TrimSpace(u.UserID) != "" {
+		return u.UserID
+	}
+	return userKeyForEmail(u.Email)
+}
+
+// userKeyForEmail derives the kind:id key from an Xray email. An
+// unrecognised email is returned as-is rather than dropped: the
+// traffic row must survive, and the panel can still match it.
+func userKeyForEmail(email string) string {
+	if rest, ok := strings.CutPrefix(email, "u-sub-"); ok {
+		if id, ok := strings.CutSuffix(rest, "@node"); ok {
+			return "subuser:" + id
+		}
+	}
+	if rest, ok := strings.CutPrefix(email, "u-merged-"); ok {
+		if id, ok := strings.CutSuffix(rest, "@node"); ok {
+			return "merged:" + id
+		}
+	}
+	return email
+}
+
+// postTraffic posts one traffic window to POST /api/v1/node/traffic
+// with the mTLS client. Any transport error or non-2xx status is an
+// error (the caller spools the window for replay).
+func postTraffic(client *http.Client, panelURL string, rep trafficReport) error {
+	data, err := json.Marshal(rep)
+	if err != nil {
+		return fmt.Errorf("encode traffic report: %w", err)
+	}
+	req, err := http.NewRequest(http.MethodPost, panelURL+"/api/v1/node/traffic", bytes.NewReader(data))
+	if err != nil {
+		return fmt.Errorf("build traffic request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Node-Backend-Version", Version)
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("POST %s/api/v1/node/traffic: %w", panelURL, err)
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("panel returned status %d for traffic report", resp.StatusCode)
+	}
+	return nil
 }
 
 // pullConfig fetches GET /api/v1/node/config once. etag is the value from

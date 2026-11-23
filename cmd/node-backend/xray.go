@@ -73,7 +73,6 @@ func renderXrayConfig(doc *nodeConfig, apiPort int) (configJSON []byte, sha stri
 	if apiPort <= 0 || apiPort > 65535 {
 		return nil, "", nil, fmt.Errorf("invalid api port %d", apiPort)
 	}
-	users := vlessClients(doc.Users)
 	inbounds := []xrayInbound{
 		{
 			Tag:      "api",
@@ -92,7 +91,10 @@ func renderXrayConfig(doc *nodeConfig, apiPort int) (configJSON []byte, sha stri
 			skippedTags = append(skippedTags, in.InboundTag)
 			continue
 		}
-		xb, skip, err := renderVLESSInbound(in, users)
+		// Slice 4: per-inbound assignment — only users assigned to
+		// this inbound go into its clients list; a user with no
+		// inbounds field goes everywhere (old behaviour).
+		xb, skip, err := renderVLESSInbound(in, vlessClientsForInbound(doc.Users, in.InboundTag))
 		if err != nil {
 			return nil, "", nil, fmt.Errorf("inbound %s: %w", in.InboundTag, err)
 		}
@@ -145,9 +147,20 @@ func renderXrayConfig(doc *nodeConfig, apiPort int) (configJSON []byte, sha stri
 // user>>> stats key (u-sub-<id>@node / u-merged-<id>@node, same as the
 // old D10 agent interface); flow is set per inbound, not here.
 func vlessClients(users []configUser) []map[string]any {
+	return vlessClientsForInbound(users, "")
+}
+
+// vlessClientsForInbound is vlessClients filtered to one inbound:
+// a user with an empty inbounds field belongs everywhere; a user
+// with a list belongs only to the listed tags. An empty tag means
+// "no filtering" (the whole list, as before slice 4).
+func vlessClientsForInbound(users []configUser, tag string) []map[string]any {
 	clients := []map[string]any{}
 	for _, u := range users {
 		if u.Disabled || strings.TrimSpace(u.VLESSUUID) == "" {
+			continue
+		}
+		if tag != "" && len(u.Inbounds) > 0 && !slicesContains(u.Inbounds, tag) {
 			continue
 		}
 		clients = append(clients, map[string]any{
@@ -156,6 +169,16 @@ func vlessClients(users []configUser) []map[string]any {
 		})
 	}
 	return clients
+}
+
+// slicesContains reports whether s holds v.
+func slicesContains(s []string, v string) bool {
+	for _, e := range s {
+		if e == v {
+			return true
+		}
+	}
+	return false
 }
 
 // inboundListen resolves a panel inbound's listen address: the

@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 )
@@ -258,20 +259,69 @@ func (c *cliAlterClient) RemoveUsers(ctx context.Context, serverAddr string, tar
 	return nil
 }
 
-// applyUserDiff hot-applies the user delta to every VLESS inbound:
-// removes (deletions + rotations) first, then adds (additions +
-// rotations). Any failure aborts the diff; the caller falls back to
-// a full rewrite+restart, so a half-applied diff never becomes the
-// recorded state.
-func applyUserDiff(ctx context.Context, client alterClient, serverAddr string, targets []vlessTarget, old, new map[string]configUser) error {
+// byInboundSets splits an effective user set per VLESS inbound tag:
+// a user with an empty inbounds field belongs to every target, a
+// user with a list only to the listed tags.
+func byInboundSets(users map[string]configUser, targets []vlessTarget) map[string]map[string]configUser {
+	out := map[string]map[string]configUser{}
+	for _, t := range targets {
+		set := map[string]configUser{}
+		for email, u := range users {
+			if len(u.Inbounds) == 0 || slicesContains(u.Inbounds, t.Tag) {
+				set[email] = u
+			}
+		}
+		out[t.Tag] = set
+	}
+	return out
+}
+
+// byInboundSetsEqual reports whether two per-inbound user sets agree
+// on every tag in tags (same emails, same UUIDs per inbound).
+func byInboundSetsEqual(a, b map[string]map[string]configUser, tags []string) bool {
+	for _, tag := range tags {
+		if !usersEqual(a[tag], b[tag]) {
+			return false
+		}
+	}
+	return true
+}
+
+// byInboundTags lists the tags present in either per-inbound set.
+func byInboundTags(a, b map[string]map[string]configUser) []string {
+	seen := map[string]bool{}
+	var tags []string
+	for _, m := range []map[string]map[string]configUser{a, b} {
+		for tag := range m {
+			if !seen[tag] {
+				seen[tag] = true
+				tags = append(tags, tag)
+			}
+		}
+	}
+	sort.Strings(tags)
+	return tags
+}
+
+// applyUserDiff hot-applies the per-inbound user delta to every VLESS
+// inbound: for each inbound, removes (deletions + rotations) first,
+// then adds (additions + rotations). A user assigned to one inbound
+// only moves there; a user assigned to all moves everywhere. Any
+// failure aborts the diff; the caller falls back to a full
+// rewrite+restart, so a half-applied diff never becomes the recorded
+// state. Every non-empty diff logs exactly one hot-applied line.
+func applyUserDiff(ctx context.Context, client alterClient, serverAddr string, targets []vlessTarget, oldSets, newSets map[string]map[string]configUser) error {
 	if len(targets) == 0 {
 		return nil
 	}
-	d := diffUsers(old, new)
-	if len(d.added) == 0 && len(d.removed) == 0 {
-		return nil
-	}
+	var added, removed, rotated int
+	changed := false
 	for _, t := range targets {
+		d := diffUsers(oldSets[t.Tag], newSets[t.Tag])
+		if len(d.added) == 0 && len(d.removed) == 0 {
+			continue
+		}
+		changed = true
 		if len(d.removed) > 0 {
 			if err := client.RemoveUsers(ctx, serverAddr, t, d.removed); err != nil {
 				return fmt.Errorf("remove users from %s: %w", t.Tag, err)
@@ -287,27 +337,39 @@ func applyUserDiff(ctx context.Context, client alterClient, serverAddr string, t
 				return fmt.Errorf("add users to %s: %w", t.Tag, err)
 			}
 		}
+		added += len(d.added)
+		removed += len(d.removed) - len(d.rotated)
+		rotated += len(d.rotated)
 	}
-	log.Printf("users hot-applied via AlterInbound: +%d -%d rotated=%d inbounds=%d",
-		len(d.added), len(d.removed)-len(d.rotated), len(d.rotated), len(targets))
+	if changed {
+		log.Printf("users hot-applied via AlterInbound: +%d -%d rotated=%d inbounds=%d",
+			added, removed, rotated, len(targets))
+	}
 	return nil
 }
 
 // usersAndStructureFromRendered parses a rendered xray.json (the file
 // on disk) and returns the user set it carries (email -> configUser,
-// per VLESS inbound) plus the SHA-256 of the same config with the
-// user lists stripped. The stripped SHA is the "structure" identity:
-// two renders with the same inbounds/ports/REALITY settings but
-// different users hash identically, so the applier can tell a
-// user-only change (hot-apply) from a structural change (restart).
-// The strip+marshal pipeline is the same one structureSHA applies to
-// fresh renders, so disk and fresh values are comparable.
-func usersAndStructureFromRendered(data []byte) (map[string]configUser, string, error) {
+// per VLESS inbound, plus the merged set over all inbounds) and the
+// SHA-256 of the same config with the user lists stripped. The
+// stripped SHA is the "structure" identity: two renders with the
+// same inbounds/ports/REALITY settings but different users hash
+// identically, so the applier can tell a user-only change
+// (hot-apply) from a structural change (restart). The strip+marshal
+// pipeline is the same one structureSHA applies to fresh renders,
+// so disk and fresh values are comparable.
+//
+// The per-inbound sets matter: a user the disk file only carries in
+// reality-443 must not be treated as present in xhttp-443 when the
+// applier diffs after a restart, or a removal from one inbound
+// would be silently skipped.
+func usersAndStructureFromRendered(data []byte) (map[string]configUser, map[string]map[string]configUser, string, error) {
 	var cfg xrayConfig
 	if err := json.Unmarshal(data, &cfg); err != nil {
-		return nil, "", fmt.Errorf("parse rendered xray config: %w", err)
+		return nil, nil, "", fmt.Errorf("parse rendered xray config: %w", err)
 	}
 	users := map[string]configUser{}
+	byInbound := map[string]map[string]configUser{}
 	for i := range cfg.Inbounds {
 		in := &cfg.Inbounds[i]
 		if in.Protocol != "vless" || in.Tag == "api" {
@@ -321,6 +383,7 @@ func usersAndStructureFromRendered(data []byte) (map[string]configUser, string, 
 		if !ok {
 			continue
 		}
+		set := map[string]configUser{}
 		for _, c := range clients {
 			m, ok := c.(map[string]any)
 			if !ok {
@@ -331,20 +394,23 @@ func usersAndStructureFromRendered(data []byte) (map[string]configUser, string, 
 			if email == "" || id == "" {
 				continue
 			}
-			users[email] = configUser{Email: email, VLESSUUID: id}
+			u := configUser{Email: email, VLESSUUID: id}
+			users[email] = u
+			set[email] = u
 		}
+		byInbound[in.Tag] = set
 		settings["clients"] = []any{}
 	}
 	stripped, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
-		return nil, "", fmt.Errorf("encode stripped xray config: %w", err)
+		return nil, nil, "", fmt.Errorf("encode stripped xray config: %w", err)
 	}
 	sum := sha256.Sum256(stripped)
-	return users, hex.EncodeToString(sum[:]), nil
+	return users, byInbound, hex.EncodeToString(sum[:]), nil
 }
 
 // structureSHA returns the stripped SHA of a freshly rendered config.
 func structureSHA(rendered []byte) (string, error) {
-	_, sha, err := usersAndStructureFromRendered(rendered)
+	_, _, sha, err := usersAndStructureFromRendered(rendered)
 	return sha, err
 }
