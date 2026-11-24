@@ -17,7 +17,7 @@ import (
 
 // Version is the agent version, sent to the panel as
 // X-Node-Backend-Version and printed by the version subcommand.
-const Version = "0.1.8"
+const Version = "0.1.9"
 
 func main() {
 	log.SetOutput(os.Stdout)

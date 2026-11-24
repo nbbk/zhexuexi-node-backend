@@ -13,6 +13,9 @@ import (
 // GET /health, POST /reload (pull now), POST /restart-core. It never
 // binds a non-loopback address: newControlServer refuses anything
 // whose host is not 127.0.0.1 or ::1.
+// Slice 8 adds POST /relay-config: the panel hands this agent a rendered
+// realm config.toml (co-located relay+node) and the agent writes it and
+// restarts realm (see relay.go).
 type controlServer struct {
 	addr  string
 	sup   *supervisor
@@ -21,12 +24,15 @@ type controlServer struct {
 	reload func() error
 	// configVersion is the currently applied panel config version.
 	configVersion func() int
-	srv           *http.Server
+	// applyRelay writes a panel-rendered realm config and restarts
+	// realm (slice 8); nil = this node does not apply relay configs.
+	applyRelay func([]byte) error
+	srv        *http.Server
 }
 
 // newControlServer builds the control server. addr must be loopback.
-// sbSup may be nil (Xray-only).
-func newControlServer(addr string, sup *supervisor, sbSup *supervisor, reload func() error, configVersion func() int) (*controlServer, error) {
+// sbSup may be nil (Xray-only). applyRelay may be nil.
+func newControlServer(addr string, sup *supervisor, sbSup *supervisor, reload func() error, configVersion func() int, applyRelay func([]byte) error) (*controlServer, error) {
 	host, _, err := net.SplitHostPort(addr)
 	if err != nil {
 		return nil, fmt.Errorf("invalid control address %q: %w", addr, err)
@@ -35,11 +41,12 @@ func newControlServer(addr string, sup *supervisor, sbSup *supervisor, reload fu
 	if ip == nil || !ip.IsLoopback() {
 		return nil, fmt.Errorf("control address %q is not loopback; refusing to bind", addr)
 	}
-	cs := &controlServer{addr: addr, sup: sup, sbSup: sbSup, reload: reload, configVersion: configVersion}
+	cs := &controlServer{addr: addr, sup: sup, sbSup: sbSup, reload: reload, configVersion: configVersion, applyRelay: applyRelay}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", cs.handleHealth)
 	mux.HandleFunc("/reload", cs.handleReload)
 	mux.HandleFunc("/restart-core", cs.handleRestartCore)
+	mux.HandleFunc("/relay-config", cs.handleRelayConfig)
 	cs.srv = &http.Server{
 		Addr:         addr,
 		Handler:      mux,
@@ -176,6 +183,39 @@ func (c *controlServer) handleRestartCore(w http.ResponseWriter, r *http.Request
 	writeControlJSON(w, http.StatusOK, map[string]any{
 		"ok": true, "core": core, "running": st.Running, "pid": st.PID,
 	})
+}
+
+// handleRelayConfig POST /relay-config (slice 8): the panel hands this
+// agent a rendered realm config.toml (co-located relay+node); the agent
+// validates it, writes it and restarts realm. Loopback only (the
+// control server refuses non-loopback binds); the body is the full
+// config text, not a path (the agent writes to its own configured path).
+func (c *controlServer) handleRelayConfig(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeControlJSON(w, http.StatusMethodNotAllowed, map[string]any{"ok": false, "error": "method not allowed"})
+		return
+	}
+	if c.applyRelay == nil {
+		writeControlJSON(w, http.StatusServiceUnavailable, map[string]any{"ok": false, "error": "relay apply not configured on this node"})
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	var req struct {
+		ConfigToml string `json:"config_toml"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeControlJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "请求格式不对"})
+		return
+	}
+	if strings.TrimSpace(req.ConfigToml) == "" {
+		writeControlJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "config_toml 不能为空"})
+		return
+	}
+	if err := c.applyRelay([]byte(req.ConfigToml)); err != nil {
+		writeControlJSON(w, http.StatusInternalServerError, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	writeControlJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
 // isLoopbackAddr reports whether addr's host is a loopback IP.

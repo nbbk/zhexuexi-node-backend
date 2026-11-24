@@ -727,7 +727,7 @@ func runAgent(args []string) error {
 		_, err := pullOnceWithApplier(client, cfg, *stateDir, applier)
 		return err
 	}
-	ctrl, err := newControlServer(cfg.ControlAddr, sup, sbSup, pull, applier.appliedVersion)
+	ctrl, err := newControlServer(cfg.ControlAddr, sup, sbSup, pull, applier.appliedVersion, newRelayApplier(cfg.RealmConfigPath, cfg.RealmBin).apply)
 	if err != nil {
 		return err
 	}

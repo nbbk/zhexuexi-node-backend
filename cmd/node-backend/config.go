@@ -44,6 +44,13 @@ type Config struct {
 	// SpoolPath is where unconfirmed traffic windows are queued
 	// (slice 4). Empty = <config-dir>/spool.json.
 	SpoolPath string `json:"spool_path,omitempty"`
+	// RealmConfigPath is the realm config.toml this agent writes when
+	// the panel hands it a relay config (slice 8, co-located relay
+	// +node). Empty = /etc/realm/config.toml.
+	RealmConfigPath string `json:"realm_config_path,omitempty"`
+	// RealmBin is the realm binary used to restart realm after the
+	// agent writes a relay config (slice 8). Empty = /usr/local/bin/realm.
+	RealmBin string `json:"realm_bin,omitempty"`
 }
 
 // defaultSingboxPath is where the install script puts the sing-box binary.
@@ -81,6 +88,12 @@ func (c *Config) applyDefaults(configDir string) {
 	}
 	if c.SpoolPath == "" {
 		c.SpoolPath = filepath.Join(configDir, "spool.json")
+	}
+	if c.RealmConfigPath == "" {
+		c.RealmConfigPath = defaultRealmConfigPath
+	}
+	if c.RealmBin == "" {
+		c.RealmBin = defaultRealmBin
 	}
 }
 
