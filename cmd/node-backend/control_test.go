@@ -22,7 +22,7 @@ func testControl(t *testing.T) (*controlServer, string, *supervisor, *int) {
 	t.Cleanup(sup.Stop)
 	waitFor(t, 5*time.Second, "xray to start", sup.IsRunning)
 	reloads := 0
-	cs, err := newControlServer("127.0.0.1:0", sup, func() error {
+	cs, err := newControlServer("127.0.0.1:0", sup, nil, func() error {
 		reloads++
 		return nil
 	}, func() int { return 7 })
@@ -106,7 +106,7 @@ func TestControlReloadError(t *testing.T) {
 		t.Fatalf("supervisor Start: %v", err)
 	}
 	t.Cleanup(sup.Stop)
-	cs, err := newControlServer("127.0.0.1:0", sup, func() error {
+	cs, err := newControlServer("127.0.0.1:0", sup, nil, func() error {
 		return errors.New("panel unreachable")
 	}, func() int { return 0 })
 	if err != nil {
@@ -145,7 +145,7 @@ func TestControlRestartCoreStartsStopped(t *testing.T) {
 	bin := fakeBinary(t, "sleep 300")
 	sup := newSupervisor(bin, filepath.Join(t.TempDir(), "xray.json"))
 	t.Cleanup(sup.Stop)
-	cs, err := newControlServer("127.0.0.1:0", sup, func() error { return nil }, func() int { return 0 })
+	cs, err := newControlServer("127.0.0.1:0", sup, nil, func() error { return nil }, func() int { return 0 })
 	if err != nil {
 		t.Fatalf("newControlServer: %v", err)
 	}
@@ -170,7 +170,7 @@ func TestControlReloadStartsStopped(t *testing.T) {
 	bin := fakeBinary(t, "sleep 300")
 	sup := newSupervisor(bin, filepath.Join(t.TempDir(), "xray.json"))
 	t.Cleanup(sup.Stop)
-	cs, err := newControlServer("127.0.0.1:0", sup, func() error { return nil }, func() int { return 0 })
+	cs, err := newControlServer("127.0.0.1:0", sup, nil, func() error { return nil }, func() int { return 0 })
 	if err != nil {
 		t.Fatalf("newControlServer: %v", err)
 	}
@@ -200,11 +200,11 @@ func TestControlMethodNotAllowed(t *testing.T) {
 func TestControlRejectsNonLoopback(t *testing.T) {
 	sup := newSupervisor("sleep", "xray.json")
 	for _, addr := range []string{"0.0.0.0:18081", "192.0.2.1:18081", "example.com:18081"} {
-		if _, err := newControlServer(addr, sup, nil, nil); err == nil {
+		if _, err := newControlServer(addr, sup, nil, nil, nil); err == nil {
 			t.Fatalf("newControlServer(%q) accepted a non-loopback address", addr)
 		}
 	}
-	if _, err := newControlServer("127.0.0.1:0", sup, nil, nil); err != nil {
+	if _, err := newControlServer("127.0.0.1:0", sup, nil, nil, nil); err != nil {
 		t.Fatalf("newControlServer(127.0.0.1:0) rejected: %v", err)
 	}
 }

@@ -45,7 +45,7 @@ func TestBuildReportContract(t *testing.T) {
 		APIPort: 10085, SpoolPath: filepath.Join(dir, "spool.json"),
 	}
 	sup := newSupervisor(cfg.XrayPath, cfg.XrayConfigPath)
-	ap := newConfigApplier(cfg, sup)
+	ap := newConfigApplier(cfg, sup, nil)
 	users := effectiveUsers(testRealityDoc().Users)
 	targets, err := vlessTargets(testRealityDoc())
 	if err != nil {
@@ -53,7 +53,7 @@ func TestBuildReportContract(t *testing.T) {
 	}
 	ap.setApplied(12, users, byInboundSets(users, targets), targets, "deadbeef")
 
-	rep := newTrafficReporter(cfg, nil, sup, ap, nil)
+	rep := newTrafficReporter(cfg, nil, sup, nil, ap, nil)
 	delta := statsDelta{
 		users: map[string][2]int64{
 			"u-sub-su-1@node":    {123, 456},
@@ -83,12 +83,12 @@ func TestBuildReportContract(t *testing.T) {
 	if !ok {
 		t.Fatalf("health is not an object: %v", m["health"])
 	}
-	for _, key := range []string{"agent_version", "xray_version", "xray_running", "xray_restarts", "config_version", "last_error", "cpu_percent", "mem_mb"} {
+	for _, key := range []string{"agent_version", "xray_version", "xray_running", "xray_restarts", "singbox_version", "singbox_running", "singbox_restarts", "config_version", "last_error", "cpu_percent", "mem_mb"} {
 		if _, ok := health[key]; !ok {
 			t.Fatalf("health missing field %q: %s", key, string(data))
 		}
 	}
-	if health["agent_version"] != "0.1.4" || health["xray_version"] != "26.11.9" {
+	if health["agent_version"] != "0.1.5" || health["xray_version"] != "26.11.9" || health["singbox_version"] != "1.14.4" {
 		t.Fatalf("health versions wrong: %v", health)
 	}
 	if health["xray_running"] != false || health["xray_restarts"] != float64(0) || health["config_version"] != float64(12) {
@@ -242,7 +242,7 @@ func TestReporterSpoolReplay(t *testing.T) {
 		t.Fatalf("newHTTPClient: %v", err)
 	}
 	sup := newSupervisor(cfg.XrayPath, cfg.XrayConfigPath)
-	ap := newConfigApplier(cfg, sup)
+	ap := newConfigApplier(cfg, sup, nil)
 	defer sup.Stop()
 	doc := testRealityDoc()
 	if err := ap.apply(doc); err != nil {
@@ -260,7 +260,7 @@ func TestReporterSpoolReplay(t *testing.T) {
 			"inbound>>>reality-443>>>traffic>>>uplink":    300,
 			"inbound>>>reality-443>>>traffic>>>downlink":  500},
 	}}
-	rep := newTrafficReporter(cfg, client, sup, ap, stats)
+	rep := newTrafficReporter(cfg, client, sup, nil, ap, stats)
 	rep.windowStart = time.Unix(1799999400, 0)
 
 	// Tick 1: baseline sample, no delta; the post fails (500).
@@ -344,10 +344,10 @@ func TestReporterXrayDownReportsHealth(t *testing.T) {
 		t.Fatalf("newHTTPClient: %v", err)
 	}
 	sup := newSupervisor(cfg.XrayPath, cfg.XrayConfigPath)
-	ap := newConfigApplier(cfg, sup)
+	ap := newConfigApplier(cfg, sup, nil)
 	defer sup.Stop()
 	// Supervisor never started: Xray is down from the start.
-	rep := newTrafficReporter(cfg, client, sup, ap, &fakeStats{samples: []statsSample{{}}})
+	rep := newTrafficReporter(cfg, client, sup, nil, ap, &fakeStats{samples: []statsSample{{}}})
 	if err := rep.tick(time.Now()); err != nil {
 		t.Fatalf("tick with Xray down should still post health: %v", err)
 	}
@@ -376,13 +376,13 @@ func TestHealthRestartsAndLastError(t *testing.T) {
 		SpoolPath: filepath.Join(dir, "spool.json"),
 	}
 	sup := newSupervisor(cfg.XrayPath, cfg.XrayConfigPath)
-	ap := newConfigApplier(cfg, sup)
+	ap := newConfigApplier(cfg, sup, nil)
 	defer sup.Stop()
 	if err := sup.Start(); err != nil {
 		t.Fatalf("start: %v", err)
 	}
 	waitFor(t, 5*time.Second, "xray to start", sup.IsRunning)
-	rep := newTrafficReporter(cfg, nil, sup, ap, nil)
+	rep := newTrafficReporter(cfg, nil, sup, nil, ap, nil)
 	if h := rep.buildHealth(); h.XrayRestarts != 0 || !h.XrayRunning {
 		t.Fatalf("fresh health = %+v, want running with 0 restarts", h)
 	}
@@ -418,7 +418,7 @@ func TestHealthRestartsAndLastError(t *testing.T) {
 func TestSampleProc(t *testing.T) {
 	dir := t.TempDir()
 	cfg := &Config{SpoolPath: filepath.Join(dir, "spool.json")}
-	rep := newTrafficReporter(cfg, nil, newSupervisor("/usr/local/bin/xray", filepath.Join(dir, "xray.json")), newConfigApplier(cfg, nil), nil)
+	rep := newTrafficReporter(cfg, nil, newSupervisor("/usr/local/bin/xray", filepath.Join(dir, "xray.json")), nil, newConfigApplier(cfg, nil, nil), nil)
 	cpu, mem := rep.sampleProc()
 	if cpu != 0 {
 		t.Fatalf("first cpu sample = %v, want 0 (no baseline)", cpu)

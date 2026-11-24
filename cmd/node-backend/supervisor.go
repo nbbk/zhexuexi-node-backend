@@ -9,17 +9,21 @@ import (
 	"time"
 )
 
-// supervisor launches the Xray child process, watches it, and restarts
+// supervisor launches one core child process, watches it, and restarts
 // it when it dies (build plan §6.2). Crash-loop guard: if the process
 // exits within quickExitWindow more than maxQuickExits times in a row,
 // the supervisor backs off for backoffDelay and logs the last error
 // instead of spinning.
 //
-// The supervisor never exits on its own: only Stop ends the watch loop.
-// All methods are safe for concurrent use.
+// One supervisor watches one core: Xray ("xray", `xray run -c ...`)
+// and sing-box ("sing-box", `sing-box run -c ...`, slice 5) each get
+// their own instance. The supervisor never exits on its own: only
+// Stop ends the watch loop. All methods are safe for concurrent use.
 type supervisor struct {
-	xrayPath   string
+	name       string // "xray" or "sing-box", used in logs and errors
+	binaryPath string
 	configPath string
+	argv       []string // args after the binary; "run -c <config>" for both cores
 
 	// Crash-loop tuning; production defaults in newSupervisor, tests
 	// override them with small values.
@@ -34,7 +38,7 @@ type supervisor struct {
 	// watching reports whether a watch loop is alive. Start() must
 	// not spawn a second watch loop while one is alive (e.g. while
 	// it is backing off after quick exits): the live loop owns
-	// restarts, and a second loop would start a second Xray. Start()
+	// restarts, and a second loop would start a second core. Start()
 	// after Stop() is not supported: the supervisor is single-use
 	// once stopped (runAgent never restarts one).
 	watching    bool
@@ -47,20 +51,29 @@ type supervisor struct {
 	restartDone chan struct{} // closed when a Restart() bounce completes
 }
 
-// newSupervisor builds a supervisor with production tuning:
+// newSupervisor builds an Xray supervisor with production tuning:
 // exit within 10s counts as a quick exit; 3 quick exits in a row
 // trigger a 60s backoff.
 func newSupervisor(xrayPath, configPath string) *supervisor {
+	return newCoreSupervisor("xray", xrayPath, configPath, "run", "-c", configPath)
+}
+
+// newCoreSupervisor builds a supervisor for one named core (slice 5):
+// the child is launched as <binaryPath> <argv...>. Xray and sing-box
+// both take "run -c <config>".
+func newCoreSupervisor(name, binaryPath, configPath string, argv ...string) *supervisor {
 	return &supervisor{
-		xrayPath:        xrayPath,
+		name:            name,
+		binaryPath:      binaryPath,
 		configPath:      configPath,
+		argv:            argv,
 		quickExitWindow: 10 * time.Second,
 		maxQuickExits:   3,
 		backoffDelay:    60 * time.Second,
 	}
 }
 
-// Start launches Xray once and starts the watch loop. A second call is
+// Start launches the core once and starts the watch loop. A second call is
 // a no-op (use Restart to bounce a running process), as is a call
 // while a watch loop is already alive: the live loop owns restarts,
 // including after a crash and during backoff.
@@ -89,13 +102,13 @@ func (s *supervisor) Start() error {
 // whole tree (a shell wrapper's children included), never leaving an
 // orphaned grandchild behind holding the log pipe.
 func (s *supervisor) startLocked() error {
-	cmd := exec.Command(s.xrayPath, "run", "-c", s.configPath)
+	cmd := exec.Command(s.binaryPath, s.argv...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Stdout = log.Writer()
 	cmd.Stderr = log.Writer()
 	if err := cmd.Start(); err != nil {
 		s.lastErr = err.Error()
-		return fmt.Errorf("start xray %s: %w", s.xrayPath, err)
+		return fmt.Errorf("start %s %s: %w", s.name, s.binaryPath, err)
 	}
 	s.cmd = cmd
 	s.pid = cmd.Process.Pid
@@ -132,17 +145,17 @@ func (s *supervisor) watch() {
 		if err != nil {
 			s.lastErr = err.Error()
 		} else {
-			s.lastErr = "xray exited (code 0)"
+			s.lastErr = s.name + " exited (code 0)"
 		}
-		log.Printf("xray exited after %s: %v; restarting", uptime.Round(time.Second), err)
+		log.Printf("%s exited after %s: %v; restarting", s.name, uptime.Round(time.Second), err)
 		if uptime < s.quickExitWindow {
 			s.quickExits++
 		} else {
 			s.quickExits = 0
 		}
 		if s.quickExits > s.maxQuickExits {
-			log.Printf("xray crashed %d times within %s; backing off %s",
-				s.quickExits, s.quickExitWindow, s.backoffDelay)
+			log.Printf("%s crashed %d times within %s; backing off %s",
+				s.name, s.quickExits, s.quickExitWindow, s.backoffDelay)
 			s.quickExits = 0
 			s.mu.Unlock()
 			time.Sleep(s.backoffDelay)
@@ -153,7 +166,7 @@ func (s *supervisor) watch() {
 			}
 		}
 		if err := s.startLocked(); err != nil {
-			log.Printf("xray restart failed: %v; retrying in %s", err, s.backoffDelay)
+			log.Printf("%s restart failed: %v; retrying in %s", s.name, err, s.backoffDelay)
 			s.mu.Unlock()
 			time.Sleep(s.backoffDelay)
 			s.mu.Lock()
@@ -184,14 +197,14 @@ func signalGroup(pid int, sig syscall.Signal) {
 	}
 }
 
-// Restart bounces the running Xray (config change path): the child is
+// Restart bounces the running core (config change path): the child is
 // killed and the watch loop brings it back. It returns an error when
 // nothing is running.
 func (s *supervisor) Restart() error {
 	s.mu.Lock()
 	if !s.running || s.cmd == nil || s.cmd.Process == nil {
 		s.mu.Unlock()
-		return fmt.Errorf("xray is not running")
+		return fmt.Errorf("%s is not running", s.name)
 	}
 	s.restartDone = make(chan struct{})
 	done := s.restartDone
@@ -202,7 +215,7 @@ func (s *supervisor) Restart() error {
 	case <-done:
 		return nil
 	case <-time.After(10 * time.Second):
-		return fmt.Errorf("xray did not come back within 10s after restart")
+		return fmt.Errorf("%s did not come back within 10s after restart", s.name)
 	}
 }
 

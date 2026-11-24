@@ -220,7 +220,7 @@ func TestApplyPerInboundMove(t *testing.T) {
 		APIPort: 10085, ControlAddr: "127.0.0.1:0",
 	}
 	sup := newSupervisor(bin, cfg.XrayConfigPath)
-	ap := newConfigApplier(cfg, sup)
+	ap := newConfigApplier(cfg, sup, nil)
 	fake := &fakeAlter{}
 	ap.alter = fake
 	defer sup.Stop()
@@ -269,7 +269,7 @@ func TestApplyStaleDiskDeleteRegression(t *testing.T) {
 		APIPort: 10085, ControlAddr: "127.0.0.1:0",
 	}
 	sup := newSupervisor(bin, cfg.XrayConfigPath)
-	ap := newConfigApplier(cfg, sup)
+	ap := newConfigApplier(cfg, sup, nil)
 	fake := &fakeAlter{}
 	ap.alter = fake
 	defer sup.Stop()

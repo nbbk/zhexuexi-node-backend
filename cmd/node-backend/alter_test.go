@@ -206,7 +206,7 @@ func TestApplyUsersOnlyHotPath(t *testing.T) {
 		APIPort: 10086, ControlAddr: "127.0.0.1:0",
 	}
 	sup := newSupervisor(xrayBin, cfg.XrayConfigPath)
-	ap := newConfigApplier(cfg, sup)
+	ap := newConfigApplier(cfg, sup, nil)
 	fake := &fakeAlter{}
 	ap.alter = fake
 	defer sup.Stop()
@@ -309,7 +309,7 @@ func TestApplyIdenticalStartsStoppedXray(t *testing.T) {
 		APIPort: 10085, ControlAddr: "127.0.0.1:0",
 	}
 	sup := newSupervisor(bin, cfg.XrayConfigPath)
-	ap := newConfigApplier(cfg, sup)
+	ap := newConfigApplier(cfg, sup, nil)
 	defer sup.Stop()
 
 	doc := testRealityDoc()
@@ -342,7 +342,7 @@ func TestApplyAlterFailureFallsBack(t *testing.T) {
 		APIPort: 10087, ControlAddr: "127.0.0.1:0",
 	}
 	sup := newSupervisor(xrayBin, cfg.XrayConfigPath)
-	ap := newConfigApplier(cfg, sup)
+	ap := newConfigApplier(cfg, sup, nil)
 	ap.alter = &fakeAlter{err: errors.New("api unreachable")}
 	defer sup.Stop()
 
@@ -428,7 +428,7 @@ func TestPull304RestartsStaleDiskResyncsUsers(t *testing.T) {
 		t.Fatalf("saveState: %v", err)
 	}
 	sup := newSupervisor(bin, cfg.XrayConfigPath)
-	ap := newConfigApplier(cfg, sup)
+	ap := newConfigApplier(cfg, sup, nil)
 	fake := &fakeAlter{}
 	ap.alter = fake
 	defer sup.Stop()
@@ -509,7 +509,7 @@ func TestPull304EnsuresXray(t *testing.T) {
 		t.Fatalf("saveState: %v", err)
 	}
 	sup := newSupervisor(bin, cfg.XrayConfigPath)
-	ap := newConfigApplier(cfg, sup)
+	ap := newConfigApplier(cfg, sup, nil)
 	defer sup.Stop()
 
 	action, err := pullOnceWithApplier(client, cfg, stateDir, ap)

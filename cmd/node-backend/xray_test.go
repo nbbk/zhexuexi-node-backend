@@ -405,7 +405,7 @@ func TestApplyConfigRealXray(t *testing.T) {
 		APIPort: 10085, ControlAddr: "127.0.0.1:0",
 	}
 	sup := newSupervisor(xrayBin, cfg.XrayConfigPath)
-	ap := newConfigApplier(cfg, sup)
+	ap := newConfigApplier(cfg, sup, nil)
 	defer sup.Stop()
 
 	doc := testRealityDoc()

@@ -1,9 +1,10 @@
 // Command node-backend is the lightweight node agent for the zhexuexi
 // node backend. It runs on the landing (node) machine, joins the panel
 // once to obtain a client certificate, then polls the panel for node
-// configuration every 60 seconds and supervises the Xray child process
-// (slice 2: REALITY + XHTTP rendering, supervision, loopback control
-// API on 127.0.0.1:18081). sing-box supervision is a later slice.
+// configuration every 60 seconds and supervises the Xray and sing-box
+// child processes (slice 2: REALITY + XHTTP rendering, Xray
+// supervision; slice 5: sing-box supervision for HY2/TUIC/AnyTLS;
+// loopback control API on 127.0.0.1:18081).
 package main
 
 import (
@@ -15,7 +16,7 @@ import (
 
 // Version is the agent version, sent to the panel as
 // X-Node-Backend-Version and printed by the version subcommand.
-const Version = "0.1.4"
+const Version = "0.1.5"
 
 func main() {
 	log.SetOutput(os.Stdout)

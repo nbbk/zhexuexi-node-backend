@@ -32,10 +32,19 @@ import (
 //   - online[].ips is empty in this slice: Xray stats do not carry
 //     IP addresses, and no data is ever fabricated — the panel
 //     treats an empty list as "unknown".
+// Slice 5: sing-box rows come from the V2Ray API stats service
+// (build plan §9.4): per-inbound counters
+// (inbound>>><tag>>>>traffic>>>uplink/downlink) and per-user
+// counters (user>>><name>>>>traffic>>>uplink/downlink, name =
+// the user's email). Both are cumulative; the reporter turns them
+// into per-window deltas with singboxCounterAccumulator, in the
+// same shape as the Xray rows above, so sing-box traffic enters
+// the same quota and limit enforcement as Xray traffic.
 //   - health.xray_restarts counts supervisor relaunches since the
 //     agent started (crash recovery + config restarts); the initial
 //     start is not a restart, so a healthy node reports 0, and an
-//     agent restart resets it to 0.
+//     agent restart resets it to 0. health.singbox_restarts is the
+//     same counter for the sing-box supervisor.
 
 // trafficUserRow is one per-user window increment.
 type trafficUserRow struct {
@@ -60,14 +69,17 @@ type trafficOnlineRow struct {
 
 // trafficHealth is the piggybacked health block.
 type trafficHealth struct {
-	AgentVersion  string  `json:"agent_version"`
-	XrayVersion   string  `json:"xray_version"`
-	XrayRunning   bool    `json:"xray_running"`
-	XrayRestarts  int     `json:"xray_restarts"`
-	ConfigVersion int     `json:"config_version"`
-	LastError     string  `json:"last_error"`
-	CPUPercent    float64 `json:"cpu_percent"`
-	MemMB         float64 `json:"mem_mb"`
+	AgentVersion    string  `json:"agent_version"`
+	XrayVersion     string  `json:"xray_version"`
+	XrayRunning     bool    `json:"xray_running"`
+	XrayRestarts    int     `json:"xray_restarts"`
+	SingboxVersion  string  `json:"singbox_version"`
+	SingboxRunning  bool    `json:"singbox_running"`
+	SingboxRestarts int     `json:"singbox_restarts"`
+	ConfigVersion   int     `json:"config_version"`
+	LastError       string  `json:"last_error"`
+	CPUPercent      float64 `json:"cpu_percent"`
+	MemMB           float64 `json:"mem_mb"`
 }
 
 // trafficReport is one POST /api/v1/node/traffic body. The panel
@@ -148,23 +160,25 @@ type trafficReporter struct {
 	client  *http.Client
 	stats   statsClient
 	sup     *supervisor
+	sbSup   *supervisor // sing-box supervisor (slice 5); nil = no sing-box
 	applier *configApplier
 
 	mu          sync.Mutex
 	acc         statsAccumulator
+	sbAcc       singboxCounterAccumulator
 	windowStart time.Time
 	lastErr     string
 	cpuPrev     *cpuSample
 }
 
 // newTrafficReporter builds a reporter. stats may be nil for the
-// default cliStatsClient (tests inject a fake).
-func newTrafficReporter(cfg *Config, client *http.Client, sup *supervisor, applier *configApplier, stats statsClient) *trafficReporter {
+// default cliStatsClient (tests inject a fake). sbSup may be nil.
+func newTrafficReporter(cfg *Config, client *http.Client, sup *supervisor, sbSup *supervisor, applier *configApplier, stats statsClient) *trafficReporter {
 	if stats == nil {
 		stats = &cliStatsClient{xrayPath: cfg.XrayPath}
 	}
 	return &trafficReporter{
-		cfg: cfg, client: client, stats: stats, sup: sup, applier: applier,
+		cfg: cfg, client: client, stats: stats, sup: sup, sbSup: sbSup, applier: applier,
 		windowStart: time.Now(),
 	}
 }
@@ -214,6 +228,44 @@ func (r *trafficReporter) tick(now time.Time) error {
 
 	users, targets, _ := r.applier.snapshot()
 	rep := r.buildReport(windowStart, now, delta, users, targets)
+	// Slice 5: sing-box rows come from the V2Ray API stats service:
+	// per-inbound counters and per-user counters (name = email).
+	// A stats failure only drops the sing-box rows for this window;
+	// it never fails the tick (the Xray delta above is reported
+	// regardless). User names are matched back to the snapshot by
+	// the same name rule the renderer uses (email, else user ID).
+	if r.sbSup != nil && r.sbSup.IsRunning() {
+		counters, err := querySingboxStats(defaultSingboxV2RayAddr)
+		if err != nil {
+			log.Printf("sing-box stats unavailable for this window (%v); no sing-box rows", err)
+		} else {
+			r.mu.Lock()
+			sbDelta := r.sbAcc.delta(counters)
+			r.mu.Unlock()
+			for tag, v := range sbDelta.inbounds {
+				if v[0] == 0 && v[1] == 0 {
+					continue
+				}
+				rep.Inbounds = append(rep.Inbounds, trafficInboundRow{InboundTag: tag, Up: v[0], Down: v[1]})
+			}
+			for name, v := range sbDelta.users {
+				if v[0] == 0 && v[1] == 0 {
+					continue
+				}
+				key, tag := userKeyForSingboxName(name, users, targets)
+				rep.Users = append(rep.Users, trafficUserRow{UserKey: key, Up: v[0], Down: v[1], InboundTag: tag})
+			}
+			sort.Slice(rep.Inbounds, func(i, j int) bool {
+				return rep.Inbounds[i].InboundTag < rep.Inbounds[j].InboundTag
+			})
+			sort.Slice(rep.Users, func(i, j int) bool {
+				if rep.Users[i].UserKey != rep.Users[j].UserKey {
+					return rep.Users[i].UserKey < rep.Users[j].UserKey
+				}
+				return rep.Users[i].InboundTag < rep.Users[j].InboundTag
+			})
+		}
+	}
 	if err := r.postWithReplay(rep, now); err != nil {
 		r.setLastErr(err)
 		return err
@@ -275,6 +327,24 @@ func (r *trafficReporter) buildReport(windowStart, windowEnd time.Time, delta st
 	return rep
 }
 
+// userKeyForSingboxName maps a sing-box stats user name back to
+// the panel user_key and the inbound_tag for its traffic row. The
+// name is the renderer's singboxUserName (email, else user ID), so
+// it is looked up in the snapshot by email first, then by user ID.
+// An unknown name still yields a row (derived key, no tag): the
+// traffic must survive, and the panel can still match it.
+func userKeyForSingboxName(name string, users map[string]configUser, targets []vlessTarget) (string, string) {
+	if u, ok := users[name]; ok {
+		return userKey(u), attributeInbound(u, targets)
+	}
+	for _, u := range users {
+		if u.UserID == name {
+			return userKey(u), attributeInbound(u, targets)
+		}
+	}
+	return userKeyForEmail(name), ""
+}
+
 // attributeInbound picks the inbound_tag for one user's row: the
 // first assigned VLESS inbound in panel order. A user with no
 // inbounds field is assigned to all of them; a user assigned only
@@ -306,17 +376,29 @@ func (r *trafficReporter) buildHealth() trafficHealth {
 		lastErr = r.lastErr
 		r.mu.Unlock()
 	}
-	cpu, mem := r.sampleProc()
-	return trafficHealth{
-		AgentVersion:  Version,
-		XrayVersion:   XrayVersion,
-		XrayRunning:   st.Running,
-		XrayRestarts:  st.Restarts,
-		ConfigVersion: r.applier.appliedVersion(),
-		LastError:     lastErr,
-		CPUPercent:    cpu,
-		MemMB:         mem,
+	health := trafficHealth{
+		AgentVersion:   Version,
+		XrayVersion:    XrayVersion,
+		XrayRunning:    st.Running,
+		XrayRestarts:   st.Restarts,
+		SingboxVersion: SingboxVersion,
+		ConfigVersion:  r.applier.appliedVersion(),
+		LastError:      lastErr,
 	}
+	if r.sbSup != nil {
+		sbSt := r.sbSup.Status()
+		health.SingboxRunning = sbSt.Running
+		health.SingboxRestarts = sbSt.Restarts
+		// sing-box is expected down when it has no inbounds; only
+		// surface its last error when it should be running but is not.
+		if health.LastError == "" && !sbSt.Running && sbSt.LastErr != "" && len(r.applier.singboxTags()) > 0 {
+			health.LastError = "sing-box: " + sbSt.LastErr
+		}
+	}
+	cpu, mem := r.sampleProc()
+	health.CPUPercent = cpu
+	health.MemMB = mem
+	return health
 }
 
 // postWithReplay posts spooled windows oldest-first, then rep. A

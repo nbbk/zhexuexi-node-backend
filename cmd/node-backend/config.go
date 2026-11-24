@@ -36,10 +36,25 @@ type Config struct {
 	// APIPort is the Xray gRPC API port on 127.0.0.1 (slice 2).
 	// 0 = defaultAPIPort.
 	APIPort int `json:"api_port,omitempty"`
+	// SingboxPath is the sing-box binary (slice 5). Empty = default.
+	SingboxPath string `json:"singbox_path,omitempty"`
+	// SingboxConfigPath is where the agent writes the rendered
+	// sing-box config (slice 5). Empty = <config-dir>/sing-box.json.
+	SingboxConfigPath string `json:"singbox_config_path,omitempty"`
 	// SpoolPath is where unconfirmed traffic windows are queued
 	// (slice 4). Empty = <config-dir>/spool.json.
 	SpoolPath string `json:"spool_path,omitempty"`
 }
+
+// defaultSingboxPath is where the install script puts the sing-box binary.
+const defaultSingboxPath = "/usr/local/bin/sing-box"
+
+// defaultSingboxV2RayAddr is the sing-box V2Ray API stats listen
+// address (slice 5, per-inbound + per-user metering, build plan
+// §9.4). Loopback only — a security invariant, not a deployment
+// value: the API exposes live traffic counters and must never
+// listen on a public address.
+const defaultSingboxV2RayAddr = "127.0.0.1:18083"
 
 // defaultControlAddr is the loopback control API address.
 const defaultControlAddr = "127.0.0.1:18081"
@@ -57,6 +72,12 @@ func (c *Config) applyDefaults(configDir string) {
 	}
 	if c.APIPort == 0 {
 		c.APIPort = defaultAPIPort
+	}
+	if c.SingboxPath == "" {
+		c.SingboxPath = defaultSingboxPath
+	}
+	if c.SingboxConfigPath == "" {
+		c.SingboxConfigPath = filepath.Join(configDir, "sing-box.json")
 	}
 	if c.SpoolPath == "" {
 		c.SpoolPath = filepath.Join(configDir, "spool.json")

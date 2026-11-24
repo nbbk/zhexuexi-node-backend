@@ -2,10 +2,13 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -30,6 +33,14 @@ type State struct {
 // or validation failure leaves the running Xray untouched and is
 // returned so the caller can log it; the next config change retries.
 //
+// Slice 5 adds the same treatment for sing-box (HY2 / TUIC /
+// AnyTLS): render, test, write, then start or restart the sing-box
+// supervisor. sing-box has no hot-apply API, so any sing-box config
+// change is a full rewrite + restart; the restart must complete
+// within 5 s (supervisor Restart bounds it at 10 s). When the
+// rendered sing-box config has no inbounds, sing-box is stopped
+// (a core with nothing to serve does not run).
+//
 // Slice 3: a change that only touches users (add/remove/rotate) is
 // hot-applied through the Xray API (AlterInbound, see alter.go) with
 // no restart. The applier remembers the applied user set and the
@@ -52,8 +63,9 @@ type State struct {
 // logged — the running state is already correct and the next pull
 // re-syncs from the panel.
 type configApplier struct {
-	cfg *Config
-	sup *supervisor
+	cfg   *Config
+	sup   *supervisor
+	sbSup *supervisor // sing-box supervisor (slice 5); nil = no sing-box
 
 	mu      sync.Mutex
 	version int
@@ -69,6 +81,13 @@ type configApplier struct {
 	appliedByInbound map[string]map[string]configUser
 	appliedTargets   []vlessTarget
 	appliedStructure string
+	// appliedSingboxSHA is the SHA of the last applied sing-box
+	// config; appliedSingboxTags are its enabled inbound tags
+	// (for traffic attribution); sbSeeded reports whether they
+	// were loaded (from disk or from a previous apply).
+	appliedSingboxSHA  string
+	appliedSingboxTags []string
+	sbSeeded           bool
 	// seeded reports whether appliedUsers/appliedStructure were
 	// loaded (from disk or from a previous apply in this process).
 	seeded bool
@@ -77,9 +96,10 @@ type configApplier struct {
 	lastErr string
 }
 
-// newConfigApplier builds an applier for cfg.
-func newConfigApplier(cfg *Config, sup *supervisor) *configApplier {
-	return &configApplier{cfg: cfg, sup: sup}
+// newConfigApplier builds an applier for cfg. sbSup may be nil (tests
+// and Xray-only nodes): sing-box is then not managed at all.
+func newConfigApplier(cfg *Config, sup *supervisor, sbSup *supervisor) *configApplier {
+	return &configApplier{cfg: cfg, sup: sup, sbSup: sbSup}
 }
 
 // appliedVersion is the panel config version currently applied to Xray
@@ -191,6 +211,234 @@ func (a *configApplier) ensureXrayRunning() (bool, error) {
 	return true, nil
 }
 
+// certsDir is where panel-issued certificates land
+// (<config-dir>/certs, slice 7 delivers them; slice 5 reads them).
+func (a *configApplier) certsDir() string {
+	return filepath.Join(filepath.Dir(a.cfg.XrayConfigPath), "certs")
+}
+
+// singboxTagsFromRendered extracts the inbound tags of a rendered
+// sing-box config document.
+func singboxTagsFromRendered(data []byte) []string {
+	var doc struct {
+		Inbounds []struct {
+			Tag string `json:"tag"`
+		} `json:"inbounds"`
+	}
+	if err := json.Unmarshal(data, &doc); err != nil {
+		return nil
+	}
+	tags := make([]string, 0, len(doc.Inbounds))
+	for _, in := range doc.Inbounds {
+		tags = append(tags, in.Tag)
+	}
+	return tags
+}
+
+// setSingboxApplied records a successful sing-box apply under the lock.
+func (a *configApplier) setSingboxApplied(sha string, tags []string) {
+	a.mu.Lock()
+	a.appliedSingboxSHA = sha
+	a.appliedSingboxTags = tags
+	a.sbSeeded = true
+	a.mu.Unlock()
+}
+
+// singboxTags returns the enabled sing-box inbound tags of the last
+// applied config, for traffic attribution (slice 5).
+func (a *configApplier) singboxTags() []string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([]string{}, a.appliedSingboxTags...)
+}
+
+// seedSingboxFromDisk loads the applied sing-box SHA and tags from
+// the sing-box.json on disk (the last full apply, which survives an
+// agent restart). A missing or unparseable file is not an error.
+func (a *configApplier) seedSingboxFromDisk() {
+	data, err := os.ReadFile(a.cfg.SingboxConfigPath)
+	if err != nil {
+		return
+	}
+	sum := sha256.Sum256(data)
+	a.setSingboxApplied(hex.EncodeToString(sum[:]), singboxTagsFromRendered(data))
+}
+
+// ensureSingboxRunning starts sing-box when it is not running (same
+// startup rule as ensureXrayRunning: an agent or server restart must
+// not leave the core down until the panel changes the config). It
+// seeds the applied sing-box SHA from disk first. When sing-box has
+// no inbounds this is a no-op returning false — a core with nothing
+// to serve does not run.
+func (a *configApplier) ensureSingboxRunning() (bool, error) {
+	if a.sbSup == nil {
+		return false, nil
+	}
+	a.mu.Lock()
+	sbSeeded := a.sbSeeded
+	tags := a.appliedSingboxTags
+	a.mu.Unlock()
+	if !sbSeeded {
+		a.seedSingboxFromDisk()
+		a.mu.Lock()
+		tags = a.appliedSingboxTags
+		a.mu.Unlock()
+	}
+	if len(tags) == 0 || a.sbSup.IsRunning() {
+		return false, nil
+	}
+	if err := a.sbSup.Start(); err != nil {
+		return false, fmt.Errorf("start sing-box: %w", err)
+	}
+	log.Printf("sing-box started (pid %d)", a.sbSup.Status().PID)
+	return true, nil
+}
+
+// checkCrossCoreTCPPorts is the agent's last line against a TCP port
+// collision between the two cores (the panel guards 443, but it does
+// not check other ports: an Xray inbound and an AnyTLS inbound on
+// the same non-443 TCP port would otherwise crash-loop the second
+// core at bind time). Loopback inbounds (the Xray API door) never
+// collide with public ones. HY2/TUIC are UDP and cannot collide
+// with Xray's TCP inbounds.
+func checkCrossCoreTCPPorts(xrayJSON, singboxJSON []byte) error {
+	var x struct {
+		Inbounds []struct {
+			Tag    string `json:"tag"`
+			Listen string `json:"listen"`
+			Port   int    `json:"port"`
+		} `json:"inbounds"`
+	}
+	if err := json.Unmarshal(xrayJSON, &x); err != nil {
+		return fmt.Errorf("parse rendered xray config: %w", err)
+	}
+	var s struct {
+		Inbounds []struct {
+			Tag    string `json:"tag"`
+			Listen string `json:"listen"`
+			Port   int    `json:"listen_port"`
+			Type   string `json:"type"`
+		} `json:"inbounds"`
+	}
+	if err := json.Unmarshal(singboxJSON, &s); err != nil {
+		return fmt.Errorf("parse rendered sing-box config: %w", err)
+	}
+	for _, sb := range s.Inbounds {
+		if sb.Type != "anytls" {
+			continue
+		}
+		for _, xb := range x.Inbounds {
+			if xb.Port != sb.Port {
+				continue
+			}
+			if ip := net.ParseIP(xb.Listen); ip != nil && ip.IsLoopback() {
+				continue
+			}
+			a, b := xb.Listen, sb.Listen
+			if a == "" {
+				a = "0.0.0.0"
+			}
+			if b == "" {
+				b = "0.0.0.0"
+			}
+			if a == "0.0.0.0" || b == "0.0.0.0" || a == b {
+				return fmt.Errorf("TCP port %d is used by both xray %s and sing-box %s", xb.Port, xb.Tag, sb.Tag)
+			}
+		}
+	}
+	return nil
+}
+
+// applySingbox renders nc for sing-box and applies it: write, test,
+// then start or restart the sing-box supervisor. A nil sbSup means
+// no sing-box management (Xray-only node or test). xrayData is the
+// freshly rendered Xray config, used for the cross-core TCP port
+// check. Any failure leaves the running sing-box untouched and the
+// next pull retries.
+func (a *configApplier) applySingbox(nc *nodeConfig, xrayData []byte) error {
+	if a.sbSup == nil {
+		return nil
+	}
+	data, sha, skipped, needsCert, err := renderSingboxConfig(nc, a.certsDir())
+	if err != nil {
+		return fmt.Errorf("render sing-box config: %w", err)
+	}
+	for _, tag := range skipped {
+		log.Printf("inbound %s skipped: not a sing-box inbound in this slice", tag)
+	}
+	for _, tag := range needsCert {
+		log.Printf("inbound %s skipped: certificate not on disk yet (slice 7 delivers certificates)", tag)
+	}
+	if err := checkCrossCoreTCPPorts(xrayData, data); err != nil {
+		return err
+	}
+	tags := singboxTagsFromRendered(data)
+	a.mu.Lock()
+	sbSeeded := a.sbSeeded
+	appliedSHA := a.appliedSingboxSHA
+	a.mu.Unlock()
+	if !sbSeeded {
+		a.seedSingboxFromDisk()
+		a.mu.Lock()
+		sbSeeded = a.sbSeeded
+		appliedSHA = a.appliedSingboxSHA
+		a.mu.Unlock()
+	}
+	if sbSeeded && appliedSHA == sha {
+		// Nothing changed: make sure the core state matches the config.
+		if len(tags) == 0 {
+			if a.sbSup.IsRunning() {
+				a.sbSup.Stop()
+				log.Printf("sing-box stopped (no sing-box inbounds left)")
+			}
+		} else if _, err := a.ensureSingboxRunning(); err != nil {
+			return err
+		}
+		return nil
+	}
+	// Write to a temp file in the same directory, validate, then rename
+	// into place so sing-box never sees a half-written config.
+	tmpFile, err := os.CreateTemp(filepath.Dir(a.cfg.SingboxConfigPath), ".sing-box-*.json")
+	if err != nil {
+		return fmt.Errorf("create sing-box config temp file: %w", err)
+	}
+	tmpPath := tmpFile.Name()
+	if _, err := tmpFile.Write(data); err != nil {
+		tmpFile.Close()
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("write sing-box config temp file: %w", err)
+	}
+	if err := tmpFile.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("close sing-box config temp file: %w", err)
+	}
+	if err := validateSingboxConfig(a.cfg.SingboxPath, tmpPath); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	if err := os.Rename(tmpPath, a.cfg.SingboxConfigPath); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("install sing-box config: %w", err)
+	}
+	log.Printf("sing-box config written: version=%d sha=%s inbounds=%d",
+		nc.ConfigVersion, sha[:12], len(tags))
+	if len(tags) == 0 {
+		if a.sbSup.IsRunning() {
+			a.sbSup.Stop()
+			log.Printf("sing-box stopped (no sing-box inbounds left)")
+		}
+	} else if !a.sbSup.IsRunning() {
+		if err := a.sbSup.Start(); err != nil {
+			return fmt.Errorf("start sing-box: %w", err)
+		}
+		log.Printf("sing-box started (pid %d)", a.sbSup.Status().PID)
+	} else if err := a.sbSup.Restart(); err != nil {
+		return fmt.Errorf("restart sing-box: %w", err)
+	}
+	a.setSingboxApplied(sha, tags)
+	return nil
+}
+
 // resyncAfterRestart forces one full config pull (no If-None-Match)
 // and applies it. It runs after a 304 that (re)started Xray from the
 // on-disk config: the disk config is normally current (slice 4
@@ -201,7 +449,7 @@ func (a *configApplier) ensureXrayRunning() (bool, error) {
 // disk-seeded user set, so a user-only drift is fixed by
 // AlterInbound, not a restart.
 func (a *configApplier) resyncAfterRestart(client *http.Client, cfg *Config, stateDir string) (runAction, error) {
-	log.Printf("xray restarted from disk config; forcing a full config re-sync")
+	log.Printf("a core restarted from disk config; forcing a full config re-sync")
 	status, nc, err := pullConfig(client, cfg.PanelURL, "")
 	if err != nil {
 		return actionContinue, err
@@ -272,6 +520,11 @@ func (a *configApplier) applyInner(nc *nodeConfig) error {
 	}
 	for _, tag := range skipped {
 		log.Printf("inbound %s skipped: not an Xray inbound in this slice", tag)
+	}
+	// Slice 5: sing-box applies first — a sing-box failure leaves
+	// Xray untouched and the next pull retries both cores together.
+	if err := a.applySingbox(nc, data); err != nil {
+		return err
 	}
 	newUsers := effectiveUsers(nc.Users)
 	structure, err := structureSHA(data)
@@ -430,13 +683,14 @@ func runAgent(args []string) error {
 	}
 
 	sup := newSupervisor(cfg.XrayPath, cfg.XrayConfigPath)
-	applier := newConfigApplier(cfg, sup)
-	reporter := newTrafficReporter(cfg, client, sup, applier, nil)
+	sbSup := newCoreSupervisor("sing-box", cfg.SingboxPath, cfg.SingboxConfigPath, "run", "-c", cfg.SingboxConfigPath)
+	applier := newConfigApplier(cfg, sup, sbSup)
+	reporter := newTrafficReporter(cfg, client, sup, sbSup, applier, nil)
 	pull := func() error {
 		_, err := pullOnceWithApplier(client, cfg, *stateDir, applier)
 		return err
 	}
-	ctrl, err := newControlServer(cfg.ControlAddr, sup, pull, applier.appliedVersion)
+	ctrl, err := newControlServer(cfg.ControlAddr, sup, sbSup, pull, applier.appliedVersion)
 	if err != nil {
 		return err
 	}
@@ -445,26 +699,28 @@ func runAgent(args []string) error {
 	}
 	defer ctrl.Stop()
 
-	// SIGINT/SIGTERM: stop Xray cleanly, then exit 0 (systemd stop).
+	// SIGINT/SIGTERM: stop both cores cleanly, then exit 0 (systemd stop).
 	sigCh := make(chan os.Signal, 2)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		<-sigCh
 		log.Printf("node-backend %s stopping: node_id=%d", Version, cfg.NodeID)
 		sup.Stop()
+		sbSup.Stop()
 		os.Exit(0)
 	}()
 
-	log.Printf("node-backend %s starting: node_id=%d panel=%s xray=%s control=%s",
-		Version, cfg.NodeID, cfg.PanelURL, cfg.XrayPath, cfg.ControlAddr)
+	log.Printf("node-backend %s starting: node_id=%d panel=%s xray=%s sing-box=%s control=%s",
+		Version, cfg.NodeID, cfg.PanelURL, cfg.XrayPath, cfg.SingboxPath, cfg.ControlAddr)
 	for {
 		action, err := pullOnceWithApplier(client, cfg, *stateDir, applier)
 		if err != nil {
 			log.Printf("config pull failed: %v; retrying in %s", err, PollInterval)
 		}
 		if action == actionDeleted {
-			log.Printf("node %d was deleted on the panel; stopping Xray and exiting (exit 0)", cfg.NodeID)
+			log.Printf("node %d was deleted on the panel; stopping cores and exiting (exit 0)", cfg.NodeID)
 			sup.Stop()
+			sbSup.Stop()
 			os.Exit(0)
 		}
 		// Slice 4: one traffic window per pull cycle, piggybacked
@@ -500,19 +756,23 @@ func pullOnceWithApplier(client *http.Client, cfg *Config, stateDir string, appl
 	switch status {
 	case pullNotModified:
 		log.Printf("config unchanged (etag %s)", st.ETag)
-		// 304 means the panel config is unchanged, not that Xray is
-		// up: an agent or server restart lands exactly here, so
-		// ensure Xray is running (and seed the applied user set
-		// from disk for later user-only diffs). When the ensure
-		// actually (re)started Xray, the on-disk config it started
-		// from may predate hot-applied user changes, so force one
-		// full re-sync to close that gap.
+		// 304 means the panel config is unchanged, not that the
+		// cores are up: an agent or server restart lands exactly
+		// here, so ensure both cores are running (and seed the
+		// applied sets from disk for later diffs). When the ensure
+		// actually (re)started a core, the on-disk config it
+		// started from may predate hot-applied user changes, so
+		// force one full re-sync to close that gap.
 		if applier != nil {
 			started, err := applier.ensureXrayRunning()
 			if err != nil {
 				return actionContinue, fmt.Errorf("ensure xray running: %w", err)
 			}
-			if started {
+			sbStarted, err := applier.ensureSingboxRunning()
+			if err != nil {
+				return actionContinue, fmt.Errorf("ensure sing-box running: %w", err)
+			}
+			if started || sbStarted {
 				return applier.resyncAfterRestart(client, cfg, stateDir)
 			}
 		}
