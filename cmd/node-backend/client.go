@@ -35,6 +35,8 @@ type configInbound struct {
 	Flow               string `json:"flow"`
 	SSMethod           string `json:"ss_method"`
 	SSPassword         string `json:"ss_password"`
+	SocksUsername      string `json:"socks_username"`
+	SocksPassword      string `json:"socks_password"`
 	Enabled            bool   `json:"enabled"`
 }
 

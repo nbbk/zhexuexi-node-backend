@@ -4,6 +4,7 @@
 // configuration every 60 seconds and supervises the Xray and sing-box
 // child processes (slice 2: REALITY + XHTTP rendering, Xray
 // supervision; slice 5: sing-box supervision for HY2/TUIC/AnyTLS;
+// slice 6: Xray SS/SS2022/SOCKS5 backup inbounds (default off);
 // loopback control API on 127.0.0.1:18081).
 package main
 
@@ -16,7 +17,7 @@ import (
 
 // Version is the agent version, sent to the panel as
 // X-Node-Backend-Version and printed by the version subcommand.
-const Version = "0.1.6"
+const Version = "0.1.7"
 
 func main() {
 	log.SetOutput(os.Stdout)

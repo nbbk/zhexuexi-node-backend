@@ -25,8 +25,10 @@ const defaultXrayPath = "/usr/local/bin/xray"
 const defaultAPIPort = 10085
 
 // xrayInbound is one enabled inbound rendered into the Xray config.
-// Only VLESS over REALITY / XHTTP / TLS is rendered in slice 2; other
-// protocols are skipped (sing-box cores are later slices) and logged.
+// Slice 2 renders VLESS over REALITY / XHTTP / TLS; slice 6 adds
+// shadowsocks (SS and SS2022, same protocol, method differs) and
+// SOCKS5 (password auth). Other protocols are skipped (sing-box cores
+// are later slices) and logged.
 //
 // Listen addresses follow the variable principle (2026-11-23): the
 // public inbound listen comes from the panel config (in.Listen, empty
@@ -65,10 +67,18 @@ type xrayConfig struct {
 //     subscriptions); clients get no flow (XHTTP + Vision is invalid);
 //   - VLESS + TLS + Vision -> tls inbound; certs come in slice 7, so a
 //     TLS inbound without a cert file errors out instead of rendering;
-//   - any other protocol (hysteria2, tuic, trojan, vmess, ss, socks,
+//   - shadowsocks -> SS / SS2022 inbound (slice 6): settings carry
+//     method + the inbound-shared password; a method starting with
+//     "2022-" is SS2022, anything else is plain SS. No streamSettings:
+//     SS UDP behaviour is Xray's default, not something the agent sets;
+//   - socks -> SOCKS5 inbound (slice 6): password auth with one
+//     account (user/pass from the panel config). No streamSettings;
+//   - any other protocol (hysteria2, tuic, anytls, trojan, vmess,
 //     ...) is skipped and the skip is returned in skippedTags;
 //   - two enabled Xray inbounds on the same TCP port is an error
 //     (the panel already guards this; the agent is the last line).
+//     The check covers the slice 6 inbounds too: SS and SOCKS5 listen
+//     on TCP as well as UDP, so they share the usedTCPPorts map.
 func renderXrayConfig(doc *nodeConfig, apiPort int) (configJSON []byte, sha string, skippedTags []string, err error) {
 	if apiPort <= 0 || apiPort > 65535 {
 		return nil, "", nil, fmt.Errorf("invalid api port %d", apiPort)
@@ -87,14 +97,22 @@ func renderXrayConfig(doc *nodeConfig, apiPort int) (configJSON []byte, sha stri
 		if !in.Enabled {
 			continue
 		}
-		if in.Protocol != "vless" {
+		var xb *xrayInbound
+		var skip bool
+		switch strings.ToLower(in.Protocol) {
+		case "vless":
+			// Slice 4: per-inbound assignment — only users assigned to
+			// this inbound go into its clients list; a user with no
+			// inbounds field goes everywhere (old behaviour).
+			xb, skip, err = renderVLESSInbound(in, vlessClientsForInbound(doc.Users, in.InboundTag))
+		case "shadowsocks":
+			xb, skip, err = renderShadowsocksInbound(in)
+		case "socks":
+			xb, skip, err = renderSocksInbound(in)
+		default:
 			skippedTags = append(skippedTags, in.InboundTag)
 			continue
 		}
-		// Slice 4: per-inbound assignment — only users assigned to
-		// this inbound go into its clients list; a user with no
-		// inbounds field goes everywhere (old behaviour).
-		xb, skip, err := renderVLESSInbound(in, vlessClientsForInbound(doc.Users, in.InboundTag))
 		if err != nil {
 			return nil, "", nil, fmt.Errorf("inbound %s: %w", in.InboundTag, err)
 		}
@@ -193,6 +211,72 @@ func inboundListen(in configInbound) (string, error) {
 		return "", fmt.Errorf("invalid listen address %q", l)
 	}
 	return l, nil
+}
+
+// renderShadowsocksInbound renders one SS / SS2022 inbound (slice 6).
+// Both are the Xray "shadowsocks" protocol; the method alone tells them
+// apart ("2022-..." methods are SS2022). The password is shared by the
+// whole inbound, not per user, so no client list is rendered. Missing
+// method or password is an error: the inbound was explicitly enabled,
+// so rendering it half-configured would fail closed later at Xray
+// startup with a worse message. Default ports (SS 8388) come from the
+// panel template; the agent never invents a port.
+func renderShadowsocksInbound(in configInbound) (*xrayInbound, bool, error) {
+	if in.Port <= 0 || in.Port > 65535 {
+		return nil, false, fmt.Errorf("invalid port %d", in.Port)
+	}
+	listen, err := inboundListen(in)
+	if err != nil {
+		return nil, false, err
+	}
+	method := strings.TrimSpace(in.SSMethod)
+	if method == "" {
+		return nil, false, fmt.Errorf("missing shadowsocks method")
+	}
+	if strings.TrimSpace(in.SSPassword) == "" {
+		return nil, false, fmt.Errorf("missing shadowsocks password")
+	}
+	return &xrayInbound{
+		Tag:      in.InboundTag,
+		Port:     in.Port,
+		Listen:   listen,
+		Protocol: "shadowsocks",
+		Settings: map[string]any{"method": method, "password": in.SSPassword},
+	}, false, nil
+}
+
+// renderSocksInbound renders one SOCKS5 inbound (slice 6). Xray's
+// "socks" protocol with password auth and a single account (user/pass
+// from the panel config). Missing credentials are an error, same
+// reasoning as renderShadowsocksInbound. The default port (1080)
+// comes from the panel template; the agent never invents a port.
+func renderSocksInbound(in configInbound) (*xrayInbound, bool, error) {
+	if in.Port <= 0 || in.Port > 65535 {
+		return nil, false, fmt.Errorf("invalid port %d", in.Port)
+	}
+	listen, err := inboundListen(in)
+	if err != nil {
+		return nil, false, err
+	}
+	user := strings.TrimSpace(in.SocksUsername)
+	if user == "" {
+		return nil, false, fmt.Errorf("missing socks username")
+	}
+	if strings.TrimSpace(in.SocksPassword) == "" {
+		return nil, false, fmt.Errorf("missing socks password")
+	}
+	return &xrayInbound{
+		Tag:      in.InboundTag,
+		Port:     in.Port,
+		Listen:   listen,
+		Protocol: "socks",
+		Settings: map[string]any{
+			"auth": "password",
+			"accounts": []map[string]any{
+				{"user": user, "pass": in.SocksPassword},
+			},
+		},
+	}, false, nil
 }
 
 // renderVLESSInbound renders one VLESS inbound. skip=true means the

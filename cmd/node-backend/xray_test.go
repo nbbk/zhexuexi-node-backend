@@ -1,7 +1,16 @@
 package main
 
 import (
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/hmac"
+	"crypto/md5"
+	"crypto/rand"
+	"crypto/sha1"
+	"encoding/binary"
 	"encoding/json"
+	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -446,4 +455,571 @@ func TestRenderDeterministic(t *testing.T) {
 	if shaA != shaB || string(a) != string(b) {
 		t.Fatalf("render is not deterministic: %s vs %s", shaA, shaB)
 	}
+}
+
+// testBackupDoc builds a panel config doc with the three slice 6
+// backup inbounds enabled (SS, SS2022, SOCKS5) plus one disabled SS
+// that must not render, on top of the default trio.
+func testBackupDoc() *nodeConfig {
+	doc := testRealityDoc()
+	doc.Inbounds = append(doc.Inbounds,
+		configInbound{
+			InboundID: 11, InboundTag: "ss-8388", Protocol: "shadowsocks",
+			Transport: "tcp", Security: "none", Port: 8388,
+			SSMethod: "aes-128-gcm", SSPassword: "test-ss-password", Enabled: true,
+		},
+		configInbound{
+			InboundID: 12, InboundTag: "ss2022-8389", Protocol: "shadowsocks",
+			Transport: "tcp", Security: "none", Port: 8389,
+			// SS2022 passwords are base64-encoded keys of the exact
+			// key length (16 bytes for 2022-blake3-aes-128-gcm):
+			// Xray rejects the config otherwise ("bad key"). The
+			// panel must generate SS2022 passwords in this form;
+			// the agent renders what the panel sends.
+			SSMethod: "2022-blake3-aes-128-gcm", SSPassword: "AAECAwQFBgcICQoLDA0ODw==", Enabled: true,
+		},
+		configInbound{
+			InboundID: 13, InboundTag: "socks-1080", Protocol: "socks",
+			Transport: "tcp", Security: "none", Port: 1080,
+			SocksUsername: "s5user", SocksPassword: "test-s5-password", Enabled: true,
+		},
+		configInbound{
+			InboundID: 14, InboundTag: "ss-off", Protocol: "shadowsocks",
+			Transport: "tcp", Security: "none", Port: 8390,
+			SSMethod: "aes-256-gcm", SSPassword: "unused", Enabled: false,
+		},
+	)
+	return doc
+}
+
+// TestRenderShadowsocksInbound: SS and SS2022 render as Xray
+// "shadowsocks" inbounds with method + the inbound-shared password;
+// the only difference between them is the method string. A disabled
+// SS inbound renders nothing and listens on nothing.
+func TestRenderShadowsocksInbound(t *testing.T) {
+	data, _, skipped, err := renderXrayConfig(testBackupDoc(), 10085)
+	if err != nil {
+		t.Fatalf("renderXrayConfig: %v", err)
+	}
+	if len(skipped) != 1 || skipped[0] != "hy2-443" {
+		t.Fatalf("skipped = %v, want [hy2-443]", skipped)
+	}
+	p := parseXrayJSON(t, data)
+	ins := p.inbounds(t)
+	if len(ins) != 6 {
+		t.Fatalf("rendered %d inbounds, want 6 (api + reality + xhttp + ss + ss2022 + socks)", len(ins))
+	}
+	for _, in := range ins {
+		if in["tag"] == "ss-off" {
+			t.Fatalf("disabled inbound ss-off must not be rendered")
+		}
+	}
+
+	ss := p.inboundByTag(t, "ss-8388")
+	if ss["protocol"] != "shadowsocks" || ss["port"] != float64(8388) {
+		t.Fatalf("ss inbound wrong: %v", ss)
+	}
+	ssSettings := strMap(t, ss["settings"])
+	if ssSettings["method"] != "aes-128-gcm" || ssSettings["password"] != "test-ss-password" {
+		t.Fatalf("ss settings wrong: %v", ssSettings)
+	}
+	if _, hasStream := ss["streamSettings"]; hasStream {
+		t.Fatalf("ss inbound must not carry streamSettings (UDP is Xray's default): %v", ss)
+	}
+
+	ss2022 := p.inboundByTag(t, "ss2022-8389")
+	if ss2022["protocol"] != "shadowsocks" || ss2022["port"] != float64(8389) {
+		t.Fatalf("ss2022 inbound wrong: %v", ss2022)
+	}
+	s2022Settings := strMap(t, ss2022["settings"])
+	if s2022Settings["method"] != "2022-blake3-aes-128-gcm" || s2022Settings["password"] != "AAECAwQFBgcICQoLDA0ODw==" {
+		t.Fatalf("ss2022 settings wrong: %v", s2022Settings)
+	}
+}
+
+// TestRenderSocksInbound: SOCKS5 renders as Xray "socks" with
+// password auth and exactly one account (user/pass from the panel).
+func TestRenderSocksInbound(t *testing.T) {
+	data, _, _, err := renderXrayConfig(testBackupDoc(), 10085)
+	if err != nil {
+		t.Fatalf("renderXrayConfig: %v", err)
+	}
+	p := parseXrayJSON(t, data)
+	s5 := p.inboundByTag(t, "socks-1080")
+	if s5["protocol"] != "socks" || s5["port"] != float64(1080) {
+		t.Fatalf("socks inbound wrong: %v", s5)
+	}
+	settings := strMap(t, s5["settings"])
+	if settings["auth"] != "password" {
+		t.Fatalf("socks auth = %v, want password", settings["auth"])
+	}
+	accounts, _ := settings["accounts"].([]any)
+	if len(accounts) != 1 {
+		t.Fatalf("socks accounts = %d, want 1", len(accounts))
+	}
+	acc := strMap(t, accounts[0])
+	if acc["user"] != "s5user" || acc["pass"] != "test-s5-password" {
+		t.Fatalf("socks account wrong: %v", acc)
+	}
+	if _, hasStream := s5["streamSettings"]; hasStream {
+		t.Fatalf("socks inbound must not carry streamSettings: %v", s5)
+	}
+}
+
+// TestRenderBackupProtocolErrors: an enabled backup inbound with
+// missing credentials (or a bad port) is a hard error, not a silent
+// skip — the user explicitly asked for it.
+func TestRenderBackupProtocolErrors(t *testing.T) {
+	base := func() *nodeConfig {
+		return &nodeConfig{OK: true, NodeID: 1, ConfigVersion: 1, Inbounds: []configInbound{
+			{InboundID: 1, InboundTag: "ss-8388", Protocol: "shadowsocks",
+				Transport: "tcp", Security: "none", Port: 8388,
+				SSMethod: "aes-128-gcm", SSPassword: "pw", Enabled: true},
+		}}
+	}
+	doc := base()
+	doc.Inbounds[0].SSMethod = ""
+	if _, _, _, err := renderXrayConfig(doc, 10085); err == nil || !strings.Contains(err.Error(), "method") {
+		t.Fatalf("SS without method should error, got %v", err)
+	}
+	doc = base()
+	doc.Inbounds[0].SSPassword = ""
+	if _, _, _, err := renderXrayConfig(doc, 10085); err == nil || !strings.Contains(err.Error(), "password") {
+		t.Fatalf("SS without password should error, got %v", err)
+	}
+	doc = base()
+	doc.Inbounds[0].Port = 0
+	if _, _, _, err := renderXrayConfig(doc, 10085); err == nil || !strings.Contains(err.Error(), "port") {
+		t.Fatalf("SS with port 0 should error, got %v", err)
+	}
+	socksDoc := &nodeConfig{OK: true, NodeID: 1, ConfigVersion: 1, Inbounds: []configInbound{
+		{InboundID: 2, InboundTag: "socks-1080", Protocol: "socks",
+			Transport: "tcp", Security: "none", Port: 1080,
+			SocksUsername: "u", SocksPassword: "p", Enabled: true},
+	}}
+	socksDoc.Inbounds[0].SocksUsername = ""
+	if _, _, _, err := renderXrayConfig(socksDoc, 10085); err == nil || !strings.Contains(err.Error(), "username") {
+		t.Fatalf("SOCKS without username should error, got %v", err)
+	}
+	socksDoc.Inbounds[0].SocksUsername = "u"
+	socksDoc.Inbounds[0].SocksPassword = ""
+	if _, _, _, err := renderXrayConfig(socksDoc, 10085); err == nil || !strings.Contains(err.Error(), "password") {
+		t.Fatalf("SOCKS without password should error, got %v", err)
+	}
+}
+
+// TestRenderPortConflictWithBackupProtocols: the TCP port conflict
+// check covers the slice 6 inbounds too — SS/SOCKS5 listen on TCP,
+// so a clash with a VLESS inbound (or with each other) is an error.
+func TestRenderPortConflictWithBackupProtocols(t *testing.T) {
+	// SS on 443, already taken by reality-443.
+	doc := testBackupDoc()
+	doc.Inbounds[3].Port = 443
+	if _, _, _, err := renderXrayConfig(doc, 10085); err == nil || !strings.Contains(err.Error(), "443") {
+		t.Fatalf("SS on 443 should conflict with reality-443, got %v", err)
+	}
+	// SOCKS5 on 8443, already taken by xhttp-443.
+	doc = testBackupDoc()
+	doc.Inbounds[5].Port = 8443
+	if _, _, _, err := renderXrayConfig(doc, 10085); err == nil || !strings.Contains(err.Error(), "8443") {
+		t.Fatalf("SOCKS on 8443 should conflict with xhttp-443, got %v", err)
+	}
+	// SS2022 and SOCKS5 on the same port.
+	doc = testBackupDoc()
+	doc.Inbounds[5].Port = 8389
+	if _, _, _, err := renderXrayConfig(doc, 10085); err == nil || !strings.Contains(err.Error(), "8389") {
+		t.Fatalf("SS2022 and SOCKS on the same port should conflict, got %v", err)
+	}
+}
+
+// TestRenderSkippedUnchanged: slice 6 does not change the skip
+// rule — HY2/TUIC/AnyTLS/Trojan/VMess are still skipped (sing-box
+// core or a later slice), never rendered by the Xray side.
+func TestRenderSkippedUnchanged(t *testing.T) {
+	doc := &nodeConfig{OK: true, NodeID: 1, ConfigVersion: 1, Inbounds: []configInbound{
+		{InboundID: 1, InboundTag: "hy2-443", Protocol: "hysteria2", Transport: "quic", Security: "tls", Port: 443, Enabled: true},
+		{InboundID: 2, InboundTag: "tuic-443", Protocol: "tuic", Transport: "quic", Security: "tls", Port: 444, Enabled: true},
+		{InboundID: 3, InboundTag: "anytls-443", Protocol: "anytls", Transport: "tcp", Security: "tls", Port: 445, Enabled: true},
+		{InboundID: 4, InboundTag: "trojan-443", Protocol: "trojan", Transport: "tcp", Security: "tls", Port: 446, Enabled: true},
+		{InboundID: 5, InboundTag: "vmess-443", Protocol: "vmess", Transport: "tcp", Security: "none", Port: 447, Enabled: true},
+	}}
+	data, _, skipped, err := renderXrayConfig(doc, 10085)
+	if err != nil {
+		t.Fatalf("renderXrayConfig: %v", err)
+	}
+	want := []string{"anytls-443", "hy2-443", "trojan-443", "tuic-443", "vmess-443"}
+	if len(skipped) != len(want) {
+		t.Fatalf("skipped = %v, want %v", skipped, want)
+	}
+	for i, w := range want {
+		if skipped[i] != w {
+			t.Fatalf("skipped = %v, want %v", skipped, want)
+		}
+	}
+	p := parseXrayJSON(t, data)
+	if len(p.inbounds(t)) != 1 {
+		t.Fatalf("rendered %d inbounds, want 1 (api only)", len(p.inbounds(t)))
+	}
+}
+
+// TestValidateXrayConfigWithBackupProtocols: the real Xray binary
+// (pinned 26.11.9) must accept a rendered config containing the
+// slice 6 inbounds.
+func TestValidateXrayConfigWithBackupProtocols(t *testing.T) {
+	xrayBin := os.Getenv("XRAY_BIN")
+	if xrayBin == "" {
+		xrayBin = filepath.Join(os.Getenv("HOME"), "workspace", "toolchains", "xray", "xray")
+	}
+	if _, err := os.Stat(xrayBin); err != nil {
+		t.Skipf("no xray binary at %s", xrayBin)
+	}
+	data, _, _, err := renderXrayConfig(testBackupDoc(), 10085)
+	if err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "xray.json")
+	if err := os.WriteFile(cfgPath, data, 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	if err := validateXrayConfig(xrayBin, cfgPath); err != nil {
+		t.Fatalf("real xray rejected the config with SS/SOCKS5 inbounds: %v", err)
+	}
+}
+
+// --- Slice 6 e2e helpers: a minimal Shadowsocks AEAD (aes-128-gcm)
+// TCP client and a SOCKS5 client, speaking to the real Xray binary.
+// Only the TCP path is exercised: the sandbox forbids UDP sockets,
+// so SS/SOCKS5 UDP (and HY2/TUIC) stay for pilot-machine acceptance.
+
+// ssEvpKey derives the shadowsocks master key with EVP_BytesToKey
+// (MD5, count 1), the same derivation Xray uses.
+func ssEvpKey(password string, keyLen int) []byte {
+	var key []byte
+	var prev []byte
+	for len(key) < keyLen {
+		h := md5.New()
+		h.Write(prev)
+		h.Write([]byte(password))
+		prev = h.Sum(nil)
+		key = append(key, prev...)
+	}
+	return key[:keyLen]
+}
+
+// ssSubkey derives the per-session AEAD subkey with HKDF-SHA1
+// (salt = the session salt, info "ss-subkey").
+func ssSubkey(masterKey, salt []byte) []byte {
+	mac := hmac.New(sha1.New, salt)
+	mac.Write(masterKey)
+	prk := mac.Sum(nil)
+	mac = hmac.New(sha1.New, prk)
+	mac.Write([]byte("ss-subkey"))
+	mac.Write([]byte{0x01})
+	return mac.Sum(nil)[:len(masterKey)]
+}
+
+func ssAEAD(subkey []byte) cipher.AEAD {
+	block, err := aes.NewCipher(subkey)
+	if err != nil {
+		panic(err)
+	}
+	aead, err := cipher.NewGCM(block)
+	if err != nil {
+		panic(err)
+	}
+	return aead
+}
+
+// ssNonce returns the 12-byte AEAD nonce for chunk counter n.
+// Shadowsocks increments the nonce little-endian (libsodium's
+// sodium_increment convention): counter 1 is 01 00 ... 00, not
+// 00 ... 01. Counter 0 is all zeros either way.
+func ssNonce(n uint64) []byte {
+	nonce := make([]byte, 12)
+	binary.LittleEndian.PutUint64(nonce[:8], n)
+	return nonce
+}
+
+// ssWriteChunk writes one AEAD chunk: sealed length (nonce n) then
+// sealed payload (nonce n+1).
+func ssWriteChunk(w io.Writer, aead cipher.AEAD, nonceCounter uint64, payload []byte) error {
+	lenBuf := make([]byte, 2)
+	binary.BigEndian.PutUint16(lenBuf, uint16(len(payload)))
+	sealedLen := aead.Seal(nil, ssNonce(nonceCounter), lenBuf, nil)
+	if _, err := w.Write(sealedLen); err != nil {
+		return err
+	}
+	sealed := aead.Seal(nil, ssNonce(nonceCounter+1), payload, nil)
+	_, err := w.Write(sealed)
+	return err
+}
+
+// ssReadChunk reads one AEAD chunk (sealed length, then sealed payload).
+func ssReadChunk(r io.Reader, aead cipher.AEAD, nonceCounter uint64) ([]byte, error) {
+	sealedLen := make([]byte, 2+aead.Overhead())
+	if _, err := io.ReadFull(r, sealedLen); err != nil {
+		return nil, err
+	}
+	lenBuf, err := aead.Open(nil, ssNonce(nonceCounter), sealedLen, nil)
+	if err != nil {
+		return nil, err
+	}
+	n := int(binary.BigEndian.Uint16(lenBuf))
+	sealed := make([]byte, n+aead.Overhead())
+	if _, err := io.ReadFull(r, sealed); err != nil {
+		return nil, err
+	}
+	return aead.Open(nil, ssNonce(nonceCounter+1), sealed, nil)
+}
+
+// ssRequest sends one AEAD chunk (address header + payload) through
+// a shadowsocks (aes-128-gcm) inbound at ssAddr with password, and
+// returns the first response chunk.
+func ssRequest(t *testing.T, ssAddr, password string, header, payload []byte) []byte {
+	t.Helper()
+	conn, err := net.DialTimeout("tcp", ssAddr, 5*time.Second)
+	if err != nil {
+		t.Fatalf("dial SS inbound: %v", err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+	masterKey := ssEvpKey(password, 16)
+	salt := make([]byte, 16)
+	if _, err := rand.Read(salt); err != nil {
+		t.Fatalf("rand salt: %v", err)
+	}
+	if _, err := conn.Write(salt); err != nil {
+		t.Fatalf("write salt: %v", err)
+	}
+	aead := ssAEAD(ssSubkey(masterKey, salt))
+	if err := ssWriteChunk(conn, aead, 0, append(header, payload...)); err != nil {
+		t.Fatalf("write SS chunk: %v", err)
+	}
+	respSalt := make([]byte, 16)
+	if _, err := io.ReadFull(conn, respSalt); err != nil {
+		t.Fatalf("read response salt: %v", err)
+	}
+	respAEAD := ssAEAD(ssSubkey(masterKey, respSalt))
+	resp, err := ssReadChunk(conn, respAEAD, 0)
+	if err != nil {
+		t.Fatalf("read SS response chunk: %v", err)
+	}
+	return resp
+}
+
+// socks5DialThrough connects to targetAddr through a SOCKS5 inbound
+// at s5Addr with username/password auth, sends payload, and returns
+// what the target echoed back.
+func socks5DialThrough(t *testing.T, s5Addr, user, pass string, targetAddr *net.TCPAddr, payload []byte) []byte {
+	t.Helper()
+	conn, err := net.DialTimeout("tcp", s5Addr, 5*time.Second)
+	if err != nil {
+		t.Fatalf("dial SOCKS5 inbound: %v", err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+	// Greeting: version 5, 1 method, username/password (0x02).
+	if _, err := conn.Write([]byte{0x05, 0x01, 0x02}); err != nil {
+		t.Fatalf("write greeting: %v", err)
+	}
+	method := make([]byte, 2)
+	if _, err := io.ReadFull(conn, method); err != nil {
+		t.Fatalf("read method selection: %v", err)
+	}
+	if method[0] != 0x05 || method[1] != 0x02 {
+		t.Fatalf("method selection = %v, want [5 2] (username/password)", method)
+	}
+	// Username/password auth (RFC 1929).
+	auth := []byte{0x01, byte(len(user))}
+	auth = append(auth, []byte(user)...)
+	auth = append(auth, byte(len(pass)))
+	auth = append(auth, []byte(pass)...)
+	if _, err := conn.Write(auth); err != nil {
+		t.Fatalf("write auth: %v", err)
+	}
+	authResp := make([]byte, 2)
+	if _, err := io.ReadFull(conn, authResp); err != nil {
+		t.Fatalf("read auth response: %v", err)
+	}
+	if authResp[0] != 0x01 || authResp[1] != 0x00 {
+		t.Fatalf("auth response = %v, want [1 0] (success)", authResp)
+	}
+	// CONNECT to the echo server.
+	req := []byte{0x05, 0x01, 0x00, 0x01}
+	req = append(req, targetAddr.IP.To4()...)
+	portBuf := make([]byte, 2)
+	binary.BigEndian.PutUint16(portBuf, uint16(targetAddr.Port))
+	req = append(req, portBuf...)
+	if _, err := conn.Write(req); err != nil {
+		t.Fatalf("write CONNECT: %v", err)
+	}
+	rep := make([]byte, 10)
+	if _, err := io.ReadFull(conn, rep); err != nil {
+		t.Fatalf("read CONNECT reply: %v", err)
+	}
+	if rep[0] != 0x05 || rep[1] != 0x00 {
+		t.Fatalf("CONNECT reply = %v, want success", rep)
+	}
+	if _, err := conn.Write(payload); err != nil {
+		t.Fatalf("write payload: %v", err)
+	}
+	buf := make([]byte, len(payload))
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		t.Fatalf("read echo: %v", err)
+	}
+	return buf
+}
+
+func freeLoopbackPort(t *testing.T) int {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("allocate port: %v", err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	ln.Close()
+	return port
+}
+
+// TestBackupProtocolsRealXray starts the real Xray binary with only
+// the slice 6 inbounds (SS + SOCKS5, loopback only) and proves the
+// TCP path end to end. The two legs use different targets on purpose:
+//   - SOCKS5 goes to a local echo server (bytes come back unchanged).
+//     SOCKS has no private-target block, so loopback works.
+//   - SS goes to a public HTTP target (1.1.1.1:80, literal IP so no
+//     DNS is involved). Xray's freedom outbound blocks
+//     shadowsocks-originated traffic to private IPs by default
+//     (defaultBlockPrivateRule: SS must not be usable to reach the
+//     node's own loopback/LAN services), so a loopback echo target
+//     is blackholed by design and cannot prove the SS path — and in
+//     this sandbox every domain resolves to 198.18.0.0/15, which
+//     Xray's private-IP matcher also covers, so a domain target
+//     does not help either. If the sandbox cannot reach 1.1.1.1:80
+//     directly the SS leg is skipped; the SOCKS leg still runs.
+//
+// Wrong SOCKS5 password must be refused. UDP is not exercised here
+// (the sandbox forbids UDP sockets); SS and SOCKS5 UDP stay for
+// pilot-machine acceptance.
+func TestBackupProtocolsRealXray(t *testing.T) {
+	xrayBin := os.Getenv("XRAY_BIN")
+	if xrayBin == "" {
+		xrayBin = filepath.Join(os.Getenv("HOME"), "workspace", "toolchains", "xray", "xray")
+	}
+	if _, err := os.Stat(xrayBin); err != nil {
+		t.Skipf("no xray binary at %s", xrayBin)
+	}
+	// Local echo server: whatever arrives comes back unchanged.
+	echoLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("echo listen: %v", err)
+	}
+	defer echoLn.Close()
+	go func() {
+		for {
+			c, err := echoLn.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				_, _ = io.Copy(c, c)
+			}(c)
+		}
+	}()
+	echoAddr := echoLn.Addr().(*net.TCPAddr)
+
+	ssPort := freeLoopbackPort(t)
+	s5Port := freeLoopbackPort(t)
+	doc := &nodeConfig{OK: true, NodeID: 1, ConfigVersion: 9, Inbounds: []configInbound{
+		{InboundID: 11, InboundTag: "ss-8388", Protocol: "shadowsocks",
+			Transport: "tcp", Security: "none", Port: ssPort, Listen: "127.0.0.1",
+			SSMethod: "aes-128-gcm", SSPassword: "test-ss-password", Enabled: true},
+		{InboundID: 13, InboundTag: "socks-1080", Protocol: "socks",
+			Transport: "tcp", Security: "none", Port: s5Port, Listen: "127.0.0.1",
+			SocksUsername: "s5user", SocksPassword: "test-s5-password", Enabled: true},
+	}}
+	dir := t.TempDir()
+	cfg := &Config{
+		XrayPath: xrayBin, XrayConfigPath: filepath.Join(dir, "xray.json"),
+		APIPort: 10087, ControlAddr: "127.0.0.1:0",
+	}
+	sup := newSupervisor(xrayBin, cfg.XrayConfigPath)
+	ap := newConfigApplier(cfg, sup, nil)
+	defer sup.Stop()
+	if err := ap.apply(doc); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	waitFor(t, 10*time.Second, "xray to start", sup.IsRunning)
+
+	ssAddr := net.JoinHostPort("127.0.0.1", itoa(ssPort))
+	s5Addr := net.JoinHostPort("127.0.0.1", itoa(s5Port))
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		c, err := net.DialTimeout("tcp", ssAddr, time.Second)
+		if err == nil {
+			c.Close()
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("SS inbound never listened on %s: %v", ssAddr, err)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	// SS leg: public HTTP target. Skip just this leg (not the whole
+	// test) when the sandbox cannot reach 1.1.1.1:80 directly.
+	if c, err := net.DialTimeout("tcp", "1.1.1.1:80", 5*time.Second); err != nil {
+		t.Logf("cannot reach 1.1.1.1:80 directly (%v); skipping the SS leg, SOCKS leg still runs", err)
+	} else {
+		c.Close()
+		// ATYP 0x01 (IPv4) + 1.1.1.1 + port 80.
+		ipHeader := []byte{0x01, 1, 1, 1, 1, 0x00, 0x50}
+		got := ssRequest(t, ssAddr, "test-ss-password", ipHeader,
+			[]byte("GET / HTTP/1.0\r\nHost: one.one.one.one\r\n\r\n"))
+		if !strings.HasPrefix(string(got), "HTTP/") {
+			t.Fatalf("SS response = %q, want an HTTP response head", got)
+		}
+	}
+
+	// SOCKS5 leg: local echo server (loopback is fine for SOCKS).
+	got := socks5DialThrough(t, s5Addr, "s5user", "test-s5-password", echoAddr, []byte("hello-s5"))
+	if string(got) != "hello-s5" {
+		t.Fatalf("SOCKS5 echo = %q, want %q", got, "hello-s5")
+	}
+
+	// Wrong SOCKS5 password must fail auth (connection closed, no CONNECT).
+	conn, err := net.DialTimeout("tcp", s5Addr, 5*time.Second)
+	if err != nil {
+		t.Fatalf("dial SOCKS5 for bad-password check: %v", err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	_, _ = conn.Write([]byte{0x05, 0x01, 0x02})
+	method := make([]byte, 2)
+	if _, err := io.ReadFull(conn, method); err != nil {
+		t.Fatalf("read method selection: %v", err)
+	}
+	_, _ = conn.Write([]byte{0x01, 0x06, 's', '5', 'u', 's', 'e', 'r', 0x05, 'w', 'r', 'o', 'n', 'g'})
+	authResp := make([]byte, 2)
+	if _, err := io.ReadFull(conn, authResp); err != nil {
+		t.Fatalf("read auth response: %v", err)
+	}
+	if authResp[1] == 0x00 {
+		t.Fatalf("SOCKS5 accepted a wrong password")
+	}
+}
+
+func itoa(n int) string {
+	if n == 0 {
+		return "0"
+	}
+	var b [8]byte
+	i := len(b)
+	for n > 0 {
+		i--
+		b[i] = byte('0' + n%10)
+		n /= 10
+	}
+	return string(b[i:])
 }

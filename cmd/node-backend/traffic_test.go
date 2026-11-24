@@ -88,7 +88,7 @@ func TestBuildReportContract(t *testing.T) {
 			t.Fatalf("health missing field %q: %s", key, string(data))
 		}
 	}
-	if health["agent_version"] != "0.1.6" || health["xray_version"] != "26.11.9" || health["singbox_version"] != "1.14.4" {
+	if health["agent_version"] != Version || health["xray_version"] != "26.11.9" || health["singbox_version"] != "1.14.4" {
 		t.Fatalf("health versions wrong: %v", health)
 	}
 	if health["xray_running"] != false || health["xray_restarts"] != float64(0) || health["config_version"] != float64(12) {
