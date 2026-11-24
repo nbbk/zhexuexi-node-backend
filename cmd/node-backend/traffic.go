@@ -126,13 +126,16 @@ func saveSpool(path string, windows []trafficReport) error {
 }
 
 // pruneSpool drops windows older than spoolMaxAge (judged by
-// window_end) and reports how many were dropped.
+// window_end) and windows whose end is not after their start. A
+// zero-length window can never be accepted (the panel rejects it
+// with 400), so it must be dropped here instead of being retried
+// forever and blocking every window behind it.
 func pruneSpool(windows []trafficReport, now time.Time) ([]trafficReport, int) {
 	cutoff := now.Add(-spoolMaxAge).Unix()
 	kept := windows[:0]
 	dropped := 0
 	for _, w := range windows {
-		if w.WindowEnd < cutoff {
+		if w.WindowEnd < cutoff || w.WindowEnd <= w.WindowStart {
 			dropped++
 			continue
 		}
@@ -201,6 +204,18 @@ func (r *trafficReporter) tick(now time.Time) error {
 	windowStart := r.windowStart
 	r.windowStart = now
 	r.mu.Unlock()
+
+	// A tick in the same wall second as the window start would build
+	// a zero-length window (window_start == window_end in unix
+	// seconds), which the panel rejects with 400 ("上报窗口不对").
+	// That window then poisons the spool: replay aborts on it every
+	// cycle and no later window is ever posted. Skip the post and
+	// keep the window open; the next tick reports the whole span.
+	// The stats baseline is not advanced either, so nothing is
+	// lost or double-counted.
+	if now.Unix() <= windowStart.Unix() {
+		return nil
+	}
 
 	delta := statsDelta{users: map[string][2]int64{}, inbounds: map[string][2]int64{}}
 	statsErr := error(nil)

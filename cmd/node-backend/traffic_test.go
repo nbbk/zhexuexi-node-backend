@@ -88,7 +88,7 @@ func TestBuildReportContract(t *testing.T) {
 			t.Fatalf("health missing field %q: %s", key, string(data))
 		}
 	}
-	if health["agent_version"] != "0.1.5" || health["xray_version"] != "26.11.9" || health["singbox_version"] != "1.14.4" {
+	if health["agent_version"] != "0.1.6" || health["xray_version"] != "26.11.9" || health["singbox_version"] != "1.14.4" {
 		t.Fatalf("health versions wrong: %v", health)
 	}
 	if health["xray_running"] != false || health["xray_restarts"] != float64(0) || health["config_version"] != float64(12) {
@@ -162,6 +162,11 @@ func TestSpoolRoundTripAndPrune(t *testing.T) {
 		{NodeID: 1, WindowStart: now.Add(-25 * time.Hour).Unix(), WindowEnd: now.Add(-25 * time.Hour).Unix()},
 		{NodeID: 1, WindowStart: now.Add(-1 * time.Hour).Unix(), WindowEnd: now.Add(-59 * time.Minute).Unix()},
 		{NodeID: 1, WindowStart: now.Add(-1 * time.Minute).Unix(), WindowEnd: now.Unix()},
+		// Fresh zero-length window (same-second start/end): the
+		// panel rejects it with 400, so it must be pruned too —
+		// otherwise it poisons the spool and blocks every window
+		// behind it (agent 0.1.5 startup race, fixed in 0.1.6).
+		{NodeID: 1, WindowStart: now.Unix(), WindowEnd: now.Unix()},
 	}
 	if err := saveSpool(path, windows); err != nil {
 		t.Fatalf("saveSpool: %v", err)
@@ -173,12 +178,12 @@ func TestSpoolRoundTripAndPrune(t *testing.T) {
 	if err != nil {
 		t.Fatalf("loadSpool: %v", err)
 	}
-	if len(loaded) != 3 {
-		t.Fatalf("loaded %d windows, want 3", len(loaded))
+	if len(loaded) != 4 {
+		t.Fatalf("loaded %d windows, want 4", len(loaded))
 	}
 	kept, dropped := pruneSpool(loaded, now)
-	if dropped != 1 || len(kept) != 2 {
-		t.Fatalf("prune dropped=%d kept=%d, want 1 and 2", dropped, len(kept))
+	if dropped != 2 || len(kept) != 2 {
+		t.Fatalf("prune dropped=%d kept=%d, want 2 and 2", dropped, len(kept))
 	}
 	if kept[0].WindowEnd != windows[1].WindowEnd {
 		t.Fatalf("prune kept the wrong windows: %+v", kept)
@@ -191,6 +196,83 @@ func TestSpoolRoundTripAndPrune(t *testing.T) {
 	}
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
 		t.Fatalf("empty spool must remove the file")
+	}
+}
+
+// TestTickSkipsZeroLengthWindow: a tick in the same wall second as
+// the window start must not post (window_start == window_end in
+// unix seconds, which the panel rejects with 400). The window is
+// kept open and the next tick reports the whole span. Regression
+// test for the agent 0.1.5 startup race: the first tick ran in the
+// same second as the reporter was built, the zero-length window
+// went into the spool, and replay aborted on it every cycle.
+func TestTickSkipsZeroLengthWindow(t *testing.T) {
+	var mu sync.Mutex
+	received := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/node/traffic" || r.Method != http.MethodPost {
+			http.NotFound(w, r)
+			return
+		}
+		mu.Lock()
+		received++
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	certPEM, keyPEM := genSelfSignedCert(t, "node-1")
+	cfg := writeTestCertFiles(t, dir, certPEM, keyPEM)
+	cfg.PanelURL = srv.URL
+	cfg.XrayPath = fakeBinary(t, "if [ \"$2\" = \"-test\" ]; then exit 0; fi\nsleep 300")
+	cfg.XrayConfigPath = filepath.Join(dir, "xray.json")
+	cfg.APIPort = 10085
+	cfg.SpoolPath = filepath.Join(dir, "spool.json")
+	client, err := newHTTPClient(cfg, nil)
+	if err != nil {
+		t.Fatalf("newHTTPClient: %v", err)
+	}
+	sup := newSupervisor(cfg.XrayPath, cfg.XrayConfigPath)
+	ap := newConfigApplier(cfg, sup, nil)
+	defer sup.Stop()
+	doc := testRealityDoc()
+	if err := ap.apply(doc); err != nil {
+		t.Fatalf("apply doc: %v", err)
+	}
+	waitFor(t, 5*time.Second, "xray to start", sup.IsRunning)
+
+	stats := &fakeStats{samples: []statsSample{{}}}
+	rep := newTrafficReporter(cfg, client, sup, nil, ap, stats)
+	rep.windowStart = time.Unix(1799999400, 0)
+
+	// Tick in the same second as the window start: no post.
+	if err := rep.tick(time.Unix(1799999400, 0)); err != nil {
+		t.Fatalf("same-second tick should be skipped, got error: %v", err)
+	}
+	mu.Lock()
+	got := received
+	mu.Unlock()
+	if got != 0 {
+		t.Fatalf("same-second tick posted %d time(s), want 0", got)
+	}
+	if _, err := os.Stat(cfg.SpoolPath); !os.IsNotExist(err) {
+		t.Fatalf("skipped tick must not create a spool file")
+	}
+
+	// Next tick 60 s later: one valid window is posted.
+	if err := rep.tick(time.Unix(1799999460, 0)); err != nil {
+		t.Fatalf("next tick should succeed: %v", err)
+	}
+	mu.Lock()
+	got = received
+	mu.Unlock()
+	if got != 1 {
+		t.Fatalf("panel received %d posts, want 1", got)
+	}
+	if _, err := os.Stat(cfg.SpoolPath); !os.IsNotExist(err) {
+		t.Fatalf("spool file must not exist after a successful post")
 	}
 }
 
@@ -348,6 +430,10 @@ func TestReporterXrayDownReportsHealth(t *testing.T) {
 	defer sup.Stop()
 	// Supervisor never started: Xray is down from the start.
 	rep := newTrafficReporter(cfg, client, sup, nil, ap, &fakeStats{samples: []statsSample{{}}})
+	// Tick a full minute after construction: a same-second tick is
+	// skipped by design (zero-length window, 0.1.6), so the window
+	// must span real time for the health-only report to go out.
+	rep.windowStart = time.Now().Add(-time.Minute)
 	if err := rep.tick(time.Now()); err != nil {
 		t.Fatalf("tick with Xray down should still post health: %v", err)
 	}

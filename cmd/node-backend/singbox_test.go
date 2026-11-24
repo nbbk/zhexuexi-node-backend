@@ -627,8 +627,12 @@ func TestSingboxAnyTLSTrafficEndToEnd(t *testing.T) {
 		APIPort: 10087,
 	}
 	rep := newTrafficReporter(repCfg, panel.Client(), xraySup, sbSup, ap, &fakeStats{samples: []statsSample{{}}})
-	// Tick 1 seeds the sing-box accumulator (no delta yet).
-	if err := rep.tick(time.Now()); err != nil {
+	// Tick 1 seeds the sing-box accumulator (no delta yet). Fixed
+	// 60 s-spaced times: a tick in the same wall second as the
+	// window start is skipped by design (zero-length window, 0.1.6),
+	// so the ticks must span real time.
+	rep.windowStart = time.Unix(1799999400, 0)
+	if err := rep.tick(time.Unix(1799999460, 0)); err != nil {
 		t.Fatalf("tick 1: %v", err)
 	}
 	// Download 5 MiB through the tunnel (SOCKS -> AnyTLS -> direct).
@@ -650,7 +654,7 @@ func TestSingboxAnyTLSTrafficEndToEnd(t *testing.T) {
 	}
 	// Tick 2 reports the window covering the download.
 	gotReport = trafficReport{}
-	if err := rep.tick(time.Now()); err != nil {
+	if err := rep.tick(time.Unix(1799999520, 0)); err != nil {
 		t.Fatalf("tick 2: %v", err)
 	}
 	if len(gotReport.Inbounds) != 1 || gotReport.Inbounds[0].InboundTag != "anytls-443" {
