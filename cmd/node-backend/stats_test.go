@@ -169,7 +169,7 @@ func TestRenderPerInboundAssignment(t *testing.T) {
 		UserID: "subuser:su-3", Kind: "subuser", ID: "su-3", Name: "u3",
 		Email: "u-sub-su-3@node", VLESSUUID: "33333333-4444-5555-6666-777777777777",
 	}) // u3: no list, everywhere
-	data, _, _, err := renderXrayConfig(doc, 10085)
+	data, _, _, _, err := renderXrayConfig(doc, 10085, "")
 	if err != nil {
 		t.Fatalf("render: %v", err)
 	}
@@ -196,7 +196,7 @@ func TestRenderPerInboundAssignment(t *testing.T) {
 	}
 	// Assignment also feeds the hot path: the per-inbound sets must
 	// split the same way.
-	targets, err := vlessTargets(doc)
+	targets, err := vlessTargets(doc, "")
 	if err != nil {
 		t.Fatalf("vlessTargets: %v", err)
 	}
@@ -276,7 +276,7 @@ func TestApplyStaleDiskDeleteRegression(t *testing.T) {
 
 	// Disk: the v2 render (users A + B), as 0.1.3 left it.
 	diskDoc := testRealityDoc()
-	diskData, _, _, err := renderXrayConfig(diskDoc, 10085)
+	diskData, _, _, _, err := renderXrayConfig(diskDoc, 10085, "")
 	if err != nil {
 		t.Fatalf("render disk doc: %v", err)
 	}
@@ -291,7 +291,7 @@ func TestApplyStaleDiskDeleteRegression(t *testing.T) {
 		UserID: "subuser:su-3", Kind: "subuser", ID: "su-3", Name: "u3",
 		Email: "u-sub-su-3@node", VLESSUUID: "33333333-4444-5555-6666-777777777777",
 	})
-	v3Data, _, _, err := renderXrayConfig(v3, 10085)
+	v3Data, _, _, _, err := renderXrayConfig(v3, 10085, "")
 	if err != nil {
 		t.Fatalf("render v3: %v", err)
 	}
@@ -300,7 +300,7 @@ func TestApplyStaleDiskDeleteRegression(t *testing.T) {
 		t.Fatalf("structure sha: %v", err)
 	}
 	users3 := effectiveUsers(v3.Users)
-	targets3, err := vlessTargets(v3)
+	targets3, err := vlessTargets(v3, "")
 	if err != nil {
 		t.Fatalf("vlessTargets: %v", err)
 	}
@@ -314,7 +314,7 @@ func TestApplyStaleDiskDeleteRegression(t *testing.T) {
 	// the stale disk file — the exact case 0.1.3 skipped.
 	v4 := testRealityDoc()
 	v4.ConfigVersion = 4
-	v4Data, _, _, err := renderXrayConfig(v4, 10085)
+	v4Data, _, _, _, err := renderXrayConfig(v4, 10085, "")
 	if err != nil {
 		t.Fatalf("render v4: %v", err)
 	}

@@ -445,7 +445,7 @@ func TestApplySingboxRealBinary(t *testing.T) {
 	xrayEmpty := []byte(`{"inbounds":[]}`)
 	doc := testSingboxDoc()
 	doc.ConfigVersion = 5
-	if err := ap.applySingbox(doc, xrayEmpty); err != nil {
+	if err := ap.applySingbox(doc, xrayEmpty, false); err != nil {
 		t.Fatalf("applySingbox: %v", err)
 	}
 	waitFor(t, 5*time.Second, "sing-box to start", sbSup.IsRunning)
@@ -480,7 +480,7 @@ func TestApplySingboxRealBinary(t *testing.T) {
 	doc2 := testSingboxDoc()
 	doc2.ConfigVersion = 6
 	doc2.Inbounds[0].Port = 34446 // move hy2
-	if err := ap.applySingbox(doc2, xrayEmpty); err != nil {
+	if err := ap.applySingbox(doc2, xrayEmpty, false); err != nil {
 		t.Fatalf("applySingbox #2: %v", err)
 	}
 	if took := time.Since(restarted); took > 5*time.Second {
@@ -497,7 +497,7 @@ func TestApplySingboxRealBinary(t *testing.T) {
 			doc3.Inbounds[i].Enabled = false
 		}
 	}
-	if err := ap.applySingbox(doc3, xrayEmpty); err != nil {
+	if err := ap.applySingbox(doc3, xrayEmpty, false); err != nil {
 		t.Fatalf("applySingbox #3: %v", err)
 	}
 	waitFor(t, 5*time.Second, "sing-box to stop", func() bool { return !sbSup.IsRunning() })
@@ -549,7 +549,7 @@ func TestSingboxAnyTLSTrafficEndToEnd(t *testing.T) {
 			{UserID: "subuser:su-1", Kind: "subuser", ID: "su-1", Name: "u1", Email: "u-sub-su-1@node", VLESSUUID: "11111111-2222-3333-4444-555555555555"},
 		},
 	}
-	if err := ap.applySingbox(doc, []byte(`{"inbounds":[]}`)); err != nil {
+	if err := ap.applySingbox(doc, []byte(`{"inbounds":[]}`), false); err != nil {
 		t.Fatalf("applySingbox: %v", err)
 	}
 	waitFor(t, 5*time.Second, "sing-box server to start", sbSup.IsRunning)
@@ -698,7 +698,7 @@ func TestApplySingboxNoCertSkips(t *testing.T) {
 	defer sbSup.Stop()
 
 	doc := testSingboxDoc() // CertRef 1, but no cert files on disk
-	if err := ap.applySingbox(doc, []byte(`{"inbounds":[]}`)); err != nil {
+	if err := ap.applySingbox(doc, []byte(`{"inbounds":[]}`), false); err != nil {
 		t.Fatalf("applySingbox without certs must not fail: %v", err)
 	}
 	if sbSup.IsRunning() {

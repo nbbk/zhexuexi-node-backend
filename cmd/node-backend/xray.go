@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os/exec"
@@ -58,30 +59,41 @@ type xrayConfig struct {
 
 // renderXrayConfig renders the panel config doc into an Xray config
 // document. It returns the JSON bytes and their SHA-256 hex (used to
-// decide whether the running Xray needs a restart).
+// decide whether the running Xray needs a restart), the tags skipped
+// because they are not Xray inbounds, and the tags skipped because
+// their certificate is not on disk yet (slice 7 delivers
+// certificates; a missing cert skips the inbound and logs, it never
+// renders a TLS inbound without one — fail-closed, same as the
+// sing-box renderer).
 //
 // Rules (build plan §6, §7):
 //   - api dokodemo-door on 127.0.0.1:APIPort, always present;
 //   - VLESS + REALITY (+Vision flow) -> reality inbound on the panel port;
 //   - VLESS + XHTTP + REALITY -> xhttp inbound (server only, never in
 //     subscriptions); clients get no flow (XHTTP + Vision is invalid);
-//   - VLESS + TLS + Vision -> tls inbound; certs come in slice 7, so a
-//     TLS inbound without a cert file errors out instead of rendering;
+//   - VLESS + TLS + Vision -> tls inbound; the certificate comes from
+//     the panel (slice 7) via CertRef -> <certsDir>/<ref>.crt/.key,
+//     rendered as tlsSettings certificates (serverName from SNI);
+//     without the certificate file the inbound is skipped, not
+//     rendered;
+//   - Trojan + TLS -> trojan inbound; clients authenticate with their
+//     VLESS UUID as password (the same one-credential-per-user rule
+//     as HY2/TUIC/AnyTLS), certificate likewise via CertRef;
 //   - shadowsocks -> SS / SS2022 inbound (slice 6): settings carry
 //     method + the inbound-shared password; a method starting with
 //     "2022-" is SS2022, anything else is plain SS. No streamSettings:
 //     SS UDP behaviour is Xray's default, not something the agent sets;
 //   - socks -> SOCKS5 inbound (slice 6): password auth with one
 //     account (user/pass from the panel config). No streamSettings;
-//   - any other protocol (hysteria2, tuic, anytls, trojan, vmess,
-//     ...) is skipped and the skip is returned in skippedTags;
+//   - any other protocol (hysteria2, tuic, anytls, vmess, ...) is
+//     skipped and the skip is returned in skippedTags;
 //   - two enabled Xray inbounds on the same TCP port is an error
 //     (the panel already guards this; the agent is the last line).
 //     The check covers the slice 6 inbounds too: SS and SOCKS5 listen
 //     on TCP as well as UDP, so they share the usedTCPPorts map.
-func renderXrayConfig(doc *nodeConfig, apiPort int) (configJSON []byte, sha string, skippedTags []string, err error) {
+func renderXrayConfig(doc *nodeConfig, apiPort int, certsDir string) (configJSON []byte, sha string, skippedTags []string, needsCertTags []string, err error) {
 	if apiPort <= 0 || apiPort > 65535 {
-		return nil, "", nil, fmt.Errorf("invalid api port %d", apiPort)
+		return nil, "", nil, nil, fmt.Errorf("invalid api port %d", apiPort)
 	}
 	inbounds := []xrayInbound{
 		{
@@ -104,7 +116,9 @@ func renderXrayConfig(doc *nodeConfig, apiPort int) (configJSON []byte, sha stri
 			// Slice 4: per-inbound assignment — only users assigned to
 			// this inbound go into its clients list; a user with no
 			// inbounds field goes everywhere (old behaviour).
-			xb, skip, err = renderVLESSInbound(in, vlessClientsForInbound(doc.Users, in.InboundTag))
+			xb, skip, err = renderVLESSInbound(in, vlessClientsForInbound(doc.Users, in.InboundTag), certsDir)
+		case "trojan":
+			xb, skip, err = renderTrojanInbound(in, doc.Users, certsDir)
 		case "shadowsocks":
 			xb, skip, err = renderShadowsocksInbound(in)
 		case "socks":
@@ -114,19 +128,24 @@ func renderXrayConfig(doc *nodeConfig, apiPort int) (configJSON []byte, sha stri
 			continue
 		}
 		if err != nil {
-			return nil, "", nil, fmt.Errorf("inbound %s: %w", in.InboundTag, err)
+			if skip && errors.Is(err, errNeedCert) {
+				needsCertTags = append(needsCertTags, in.InboundTag)
+				continue
+			}
+			return nil, "", nil, nil, fmt.Errorf("inbound %s: %w", in.InboundTag, err)
 		}
 		if skip {
 			skippedTags = append(skippedTags, in.InboundTag)
 			continue
 		}
 		if prev, ok := usedTCPPorts[xb.Port]; ok {
-			return nil, "", nil, fmt.Errorf("TCP port %d is used by both %s and %s", xb.Port, prev, xb.Tag)
+			return nil, "", nil, nil, fmt.Errorf("TCP port %d is used by both %s and %s", xb.Port, prev, xb.Tag)
 		}
 		usedTCPPorts[xb.Port] = xb.Tag
 		inbounds = append(inbounds, *xb)
 	}
 	sort.Strings(skippedTags)
+	sort.Strings(needsCertTags)
 
 	cfg := xrayConfig{
 		Log: map[string]any{"loglevel": "warning"},
@@ -154,10 +173,10 @@ func renderXrayConfig(doc *nodeConfig, apiPort int) (configJSON []byte, sha stri
 	}
 	data, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
-		return nil, "", nil, fmt.Errorf("encode xray config: %w", err)
+		return nil, "", nil, nil, fmt.Errorf("encode xray config: %w", err)
 	}
 	sum := sha256.Sum256(data)
-	return data, hex.EncodeToString(sum[:]), skippedTags, nil
+	return data, hex.EncodeToString(sum[:]), skippedTags, needsCertTags, nil
 }
 
 // vlessClients turns panel users into VLESS client entries. Disabled
@@ -280,9 +299,11 @@ func renderSocksInbound(in configInbound) (*xrayInbound, bool, error) {
 }
 
 // renderVLESSInbound renders one VLESS inbound. skip=true means the
-// combination is not an Xray inbound in this slice (TLS without a cert
-// file is an error instead, because the user explicitly asked for it).
-func renderVLESSInbound(in configInbound, users []map[string]any) (*xrayInbound, bool, error) {
+// combination is not an Xray inbound in this slice; a skip caused by
+// a missing certificate file carries errNeedCert (the caller sorts
+// it into needsCertTags) instead of an error, so one inbound without
+// its certificate never blocks the rest of the config.
+func renderVLESSInbound(in configInbound, users []map[string]any, certsDir string) (*xrayInbound, bool, error) {
 	if in.Port <= 0 || in.Port > 65535 {
 		return nil, false, fmt.Errorf("invalid port %d", in.Port)
 	}
@@ -351,9 +372,33 @@ func renderVLESSInbound(in configInbound, users []map[string]any) (*xrayInbound,
 	case "tcp":
 		switch in.Security {
 		case "tls":
-			// TLS certs are issued and shipped by the panel in slice 7;
-			// until then a TLS inbound cannot be rendered.
-			return nil, false, fmt.Errorf("TLS inbound needs a certificate file (slice 7); no certs shipped yet")
+			// TLS certificate from the panel (slice 7): CertRef ->
+			// <certsDir>/<ref>.crt/.key. Missing file skips this
+			// inbound (fail-closed); the apply logs it and the
+			// inbound appears once the certificate is delivered.
+			crt, key, err := certFiles(certsDir, in.CertRef)
+			if err != nil {
+				return nil, true, errNeedCert
+			}
+			for _, c := range users {
+				cc := map[string]any{"id": c["id"], "email": c["email"]}
+				if f := strings.TrimSpace(in.Flow); f != "" {
+					cc["flow"] = f
+				}
+				clients = append(clients, cc)
+			}
+			return &xrayInbound{
+				Tag:      in.InboundTag,
+				Port:     in.Port,
+				Listen:   listen,
+				Protocol: "vless",
+				Settings: map[string]any{"clients": clients, "decryption": "none"},
+				StreamSettings: map[string]any{
+					"network":     "tcp",
+					"security":    "tls",
+					"tlsSettings": xrayTLSSettings(in, crt, key),
+				},
+			}, false, nil
 		case "none":
 			// Plain TCP VLESS is deliberately not served: no camouflage.
 			return nil, true, nil
@@ -363,6 +408,75 @@ func renderVLESSInbound(in configInbound, users []map[string]any) (*xrayInbound,
 	default:
 		return nil, true, nil
 	}
+}
+
+// errNeedCert marks a skip caused by a missing certificate file:
+// the inbound is not rendered, but the rest of the config still
+// applies (fail-closed per inbound, not per config).
+var errNeedCert = errors.New("certificate file not on disk yet")
+
+// xrayTLSSettings builds the Xray tlsSettings block for a TLS
+// inbound: serverName from SNI (falling back to Domain) and the
+// panel-issued certificate files resolved via CertRef.
+func xrayTLSSettings(in configInbound, crt, key string) map[string]any {
+	tlsSettings := map[string]any{
+		"certificates": []map[string]any{
+			{"certificateFile": crt, "keyFile": key},
+		},
+	}
+	if name := tlsServerName(in); name != "" {
+		tlsSettings["serverName"] = name
+	}
+	return tlsSettings
+}
+
+// tlsServerName is the TLS server name for an Xray TLS inbound: the
+// SNI (the panel requires a real domain for TLS inbounds), falling
+// back to the Domain field.
+func tlsServerName(in configInbound) string {
+	if d := strings.TrimSpace(in.SNI); d != "" {
+		return d
+	}
+	return strings.TrimSpace(in.Domain)
+}
+
+// renderTrojanInbound renders one Trojan inbound (slice 7, TLS only).
+// Each user authenticates with their VLESS UUID as the Trojan
+// password — the same one-credential-per-user rule as HY2/TUIC/
+// AnyTLS — filtered by the slice 4 per-inbound assignment, with the
+// email kept for stats. A non-TLS Trojan is skipped (no camouflage
+// without TLS); a missing certificate file skips with errNeedCert.
+func renderTrojanInbound(in configInbound, users []configUser, certsDir string) (*xrayInbound, bool, error) {
+	if in.Port <= 0 || in.Port > 65535 {
+		return nil, false, fmt.Errorf("invalid port %d", in.Port)
+	}
+	listen, err := inboundListen(in)
+	if err != nil {
+		return nil, false, err
+	}
+	if strings.ToLower(in.Transport) != "tcp" || strings.ToLower(in.Security) != "tls" {
+		return nil, true, nil
+	}
+	crt, key, err := certFiles(certsDir, in.CertRef)
+	if err != nil {
+		return nil, true, errNeedCert
+	}
+	clients := []map[string]any{}
+	for _, u := range vlessClientsForInbound(users, in.InboundTag) {
+		clients = append(clients, map[string]any{"password": u["id"], "email": u["email"]})
+	}
+	return &xrayInbound{
+		Tag:      in.InboundTag,
+		Port:     in.Port,
+		Listen:   listen,
+		Protocol: "trojan",
+		Settings: map[string]any{"clients": clients},
+		StreamSettings: map[string]any{
+			"network":     "tcp",
+			"security":    "tls",
+			"tlsSettings": xrayTLSSettings(in, crt, key),
+		},
+	}, false, nil
 }
 
 // realitySettings builds the REALITY server block. No minClientVer

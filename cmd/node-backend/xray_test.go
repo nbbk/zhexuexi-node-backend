@@ -113,7 +113,7 @@ func strMap(t *testing.T, v any) map[string]any {
 // xhttp; hy2 is skipped (sing-box core, later slice). REALITY carries
 // no minClientVer (0.1.2), and Vision flow on clients.
 func TestRenderRealityInbound(t *testing.T) {
-	data, sha, skipped, err := renderXrayConfig(testRealityDoc(), 10085)
+	data, sha, skipped, _, err := renderXrayConfig(testRealityDoc(), 10085, "")
 	if err != nil {
 		t.Fatalf("renderXrayConfig: %v", err)
 	}
@@ -200,25 +200,26 @@ func TestRenderRealityInbound(t *testing.T) {
 }
 
 // TestRenderSkipsDisabledAndNonVLESS: disabled inbounds are not
-// rendered; other protocols are skipped, not errors.
+// rendered; other protocols are skipped, not errors. (Trojan is an
+// Xray inbound since slice 7, so vmess stands in for "other".)
 func TestRenderSkipsDisabledAndNonVLESS(t *testing.T) {
 	doc := testRealityDoc()
 	doc.Inbounds[0].Enabled = false
 	doc.Inbounds = append(doc.Inbounds, configInbound{
-		InboundID: 4, InboundTag: "trojan-443", Protocol: "trojan",
+		InboundID: 4, InboundTag: "vmess-443", Protocol: "vmess",
 		Transport: "tcp", Security: "tls", Port: 444, Enabled: true,
 	})
-	data, _, skipped, err := renderXrayConfig(doc, 10085)
+	data, _, skipped, _, err := renderXrayConfig(doc, 10085, "")
 	if err != nil {
 		t.Fatalf("renderXrayConfig: %v", err)
 	}
 	p := parseXrayJSON(t, data)
 	for _, in := range p.inbounds(t) {
-		if in["tag"] == "reality-443" || in["tag"] == "trojan-443" {
+		if in["tag"] == "reality-443" || in["tag"] == "vmess-443" {
 			t.Fatalf("inbound %v should not be rendered", in["tag"])
 		}
 	}
-	want := map[string]bool{"hy2-443": true, "trojan-443": true}
+	want := map[string]bool{"hy2-443": true, "vmess-443": true}
 	for _, s := range skipped {
 		delete(want, s)
 	}
@@ -227,8 +228,10 @@ func TestRenderSkipsDisabledAndNonVLESS(t *testing.T) {
 	}
 }
 
-// TestRenderErrors: port conflicts, missing REALITY key and TLS
-// without certs are hard errors (nothing is applied).
+// TestRenderErrors: port conflicts and missing REALITY keys are hard
+// errors (nothing is applied). A TLS inbound without its certificate
+// is not an error: it is skipped (needsCert) so one inbound without
+// its certificate never blocks the rest of the config (slice 7).
 func TestRenderErrors(t *testing.T) {
 	// Two enabled Xray inbounds on the same TCP port.
 	doc := testRealityDoc()
@@ -238,30 +241,41 @@ func TestRenderErrors(t *testing.T) {
 		SNI: "www.example.com", RealityPrivateKey: "KMI9fIon8C4SCjMV5lydfxlLmiV9aKEvhRi73M2uf38",
 		RealityShortID: "ffffffff", Enabled: true,
 	})
-	if _, _, _, err := renderXrayConfig(doc, 10085); err == nil || !strings.Contains(err.Error(), "443") {
+	if _, _, _, _, err := renderXrayConfig(doc, 10085, ""); err == nil || !strings.Contains(err.Error(), "443") {
 		t.Fatalf("port conflict should error with the port, got %v", err)
 	}
 
 	// REALITY inbound without a private key.
 	doc = testRealityDoc()
 	doc.Inbounds[0].RealityPrivateKey = ""
-	if _, _, _, err := renderXrayConfig(doc, 10085); err == nil || !strings.Contains(err.Error(), "private key") {
+	if _, _, _, _, err := renderXrayConfig(doc, 10085, ""); err == nil || !strings.Contains(err.Error(), "private key") {
 		t.Fatalf("missing private key should error, got %v", err)
 	}
 
-	// TLS inbound without certs (slice 7 ships them).
+	// TLS inbound without certs (slice 7 ships them): skipped, not
+	// an error, and the rest of the config still renders.
 	doc = testRealityDoc()
 	doc.Inbounds = append(doc.Inbounds, configInbound{
 		InboundID: 10, InboundTag: "tls-443", Protocol: "vless",
 		Transport: "tcp", Security: "tls", Port: 8443,
 		SNI: "node1.example.com", Flow: "xtls-rprx-vision", Enabled: true,
 	})
-	if _, _, _, err := renderXrayConfig(doc, 10085); err == nil || !strings.Contains(err.Error(), "certificate") {
-		t.Fatalf("TLS without certs should error, got %v", err)
+	data, _, _, needsCert, err := renderXrayConfig(doc, 10085, "")
+	if err != nil {
+		t.Fatalf("TLS without certs must skip, not error, got %v", err)
+	}
+	if len(needsCert) != 1 || needsCert[0] != "tls-443" {
+		t.Fatalf("needsCert = %v, want [tls-443]", needsCert)
+	}
+	p := parseXrayJSON(t, data)
+	for _, in := range p.inbounds(t) {
+		if in["tag"] == "tls-443" {
+			t.Fatalf("tls-443 without a certificate must not be rendered")
+		}
 	}
 
 	// Bad API port.
-	if _, _, _, err := renderXrayConfig(testRealityDoc(), 0); err == nil {
+	if _, _, _, _, err := renderXrayConfig(testRealityDoc(), 0, ""); err == nil {
 		t.Fatalf("api port 0 should error")
 	}
 }
@@ -294,7 +308,7 @@ func TestValidateXrayConfig(t *testing.T) {
 	if _, err := os.Stat(xrayBin); err != nil {
 		t.Skipf("no xray binary at %s", xrayBin)
 	}
-	data, _, _, err := renderXrayConfig(testRealityDoc(), 10085)
+	data, _, _, _, err := renderXrayConfig(testRealityDoc(), 10085, "")
 	if err != nil {
 		t.Fatalf("render: %v", err)
 	}
@@ -324,7 +338,7 @@ func TestValidateXrayConfig(t *testing.T) {
 func TestRenderListenFromConfig(t *testing.T) {
 	doc := testRealityDoc()
 	doc.Inbounds[0].Listen = "203.0.113.1"
-	data, _, _, err := renderXrayConfig(doc, 10085)
+	data, _, _, _, err := renderXrayConfig(doc, 10085, "")
 	if err != nil {
 		t.Fatalf("render: %v", err)
 	}
@@ -338,7 +352,7 @@ func TestRenderListenFromConfig(t *testing.T) {
 
 	doc = testRealityDoc()
 	doc.Inbounds[0].Listen = "not-an-ip"
-	if _, _, _, err := renderXrayConfig(doc, 10085); err == nil {
+	if _, _, _, _, err := renderXrayConfig(doc, 10085, ""); err == nil {
 		t.Fatalf("invalid listen address should fail the render")
 	}
 }
@@ -346,7 +360,7 @@ func TestRenderListenFromConfig(t *testing.T) {
 // TestRenderAPIPortFromConfig: the Xray gRPC API port is a parameter,
 // not a literal: render with 10086 and the api inbound moves with it.
 func TestRenderAPIPortFromConfig(t *testing.T) {
-	data, _, _, err := renderXrayConfig(testRealityDoc(), 10086)
+	data, _, _, _, err := renderXrayConfig(testRealityDoc(), 10086, "")
 	if err != nil {
 		t.Fatalf("render: %v", err)
 	}
@@ -444,11 +458,11 @@ func TestApplyConfigRealXray(t *testing.T) {
 // TestRenderDeterministic: same doc renders byte-identical output
 // (restart decisions rely on the SHA).
 func TestRenderDeterministic(t *testing.T) {
-	a, shaA, _, err := renderXrayConfig(testRealityDoc(), 10085)
+	a, shaA, _, _, err := renderXrayConfig(testRealityDoc(), 10085, "")
 	if err != nil {
 		t.Fatalf("render #1: %v", err)
 	}
-	b, shaB, _, err := renderXrayConfig(testRealityDoc(), 10085)
+	b, shaB, _, _, err := renderXrayConfig(testRealityDoc(), 10085, "")
 	if err != nil {
 		t.Fatalf("render #2: %v", err)
 	}
@@ -497,7 +511,7 @@ func testBackupDoc() *nodeConfig {
 // the only difference between them is the method string. A disabled
 // SS inbound renders nothing and listens on nothing.
 func TestRenderShadowsocksInbound(t *testing.T) {
-	data, _, skipped, err := renderXrayConfig(testBackupDoc(), 10085)
+	data, _, skipped, _, err := renderXrayConfig(testBackupDoc(), 10085, "")
 	if err != nil {
 		t.Fatalf("renderXrayConfig: %v", err)
 	}
@@ -540,7 +554,7 @@ func TestRenderShadowsocksInbound(t *testing.T) {
 // TestRenderSocksInbound: SOCKS5 renders as Xray "socks" with
 // password auth and exactly one account (user/pass from the panel).
 func TestRenderSocksInbound(t *testing.T) {
-	data, _, _, err := renderXrayConfig(testBackupDoc(), 10085)
+	data, _, _, _, err := renderXrayConfig(testBackupDoc(), 10085, "")
 	if err != nil {
 		t.Fatalf("renderXrayConfig: %v", err)
 	}
@@ -579,17 +593,17 @@ func TestRenderBackupProtocolErrors(t *testing.T) {
 	}
 	doc := base()
 	doc.Inbounds[0].SSMethod = ""
-	if _, _, _, err := renderXrayConfig(doc, 10085); err == nil || !strings.Contains(err.Error(), "method") {
+	if _, _, _, _, err := renderXrayConfig(doc, 10085, ""); err == nil || !strings.Contains(err.Error(), "method") {
 		t.Fatalf("SS without method should error, got %v", err)
 	}
 	doc = base()
 	doc.Inbounds[0].SSPassword = ""
-	if _, _, _, err := renderXrayConfig(doc, 10085); err == nil || !strings.Contains(err.Error(), "password") {
+	if _, _, _, _, err := renderXrayConfig(doc, 10085, ""); err == nil || !strings.Contains(err.Error(), "password") {
 		t.Fatalf("SS without password should error, got %v", err)
 	}
 	doc = base()
 	doc.Inbounds[0].Port = 0
-	if _, _, _, err := renderXrayConfig(doc, 10085); err == nil || !strings.Contains(err.Error(), "port") {
+	if _, _, _, _, err := renderXrayConfig(doc, 10085, ""); err == nil || !strings.Contains(err.Error(), "port") {
 		t.Fatalf("SS with port 0 should error, got %v", err)
 	}
 	socksDoc := &nodeConfig{OK: true, NodeID: 1, ConfigVersion: 1, Inbounds: []configInbound{
@@ -598,12 +612,12 @@ func TestRenderBackupProtocolErrors(t *testing.T) {
 			SocksUsername: "u", SocksPassword: "p", Enabled: true},
 	}}
 	socksDoc.Inbounds[0].SocksUsername = ""
-	if _, _, _, err := renderXrayConfig(socksDoc, 10085); err == nil || !strings.Contains(err.Error(), "username") {
+	if _, _, _, _, err := renderXrayConfig(socksDoc, 10085, ""); err == nil || !strings.Contains(err.Error(), "username") {
 		t.Fatalf("SOCKS without username should error, got %v", err)
 	}
 	socksDoc.Inbounds[0].SocksUsername = "u"
 	socksDoc.Inbounds[0].SocksPassword = ""
-	if _, _, _, err := renderXrayConfig(socksDoc, 10085); err == nil || !strings.Contains(err.Error(), "password") {
+	if _, _, _, _, err := renderXrayConfig(socksDoc, 10085, ""); err == nil || !strings.Contains(err.Error(), "password") {
 		t.Fatalf("SOCKS without password should error, got %v", err)
 	}
 }
@@ -615,26 +629,28 @@ func TestRenderPortConflictWithBackupProtocols(t *testing.T) {
 	// SS on 443, already taken by reality-443.
 	doc := testBackupDoc()
 	doc.Inbounds[3].Port = 443
-	if _, _, _, err := renderXrayConfig(doc, 10085); err == nil || !strings.Contains(err.Error(), "443") {
+	if _, _, _, _, err := renderXrayConfig(doc, 10085, ""); err == nil || !strings.Contains(err.Error(), "443") {
 		t.Fatalf("SS on 443 should conflict with reality-443, got %v", err)
 	}
 	// SOCKS5 on 8443, already taken by xhttp-443.
 	doc = testBackupDoc()
 	doc.Inbounds[5].Port = 8443
-	if _, _, _, err := renderXrayConfig(doc, 10085); err == nil || !strings.Contains(err.Error(), "8443") {
+	if _, _, _, _, err := renderXrayConfig(doc, 10085, ""); err == nil || !strings.Contains(err.Error(), "8443") {
 		t.Fatalf("SOCKS on 8443 should conflict with xhttp-443, got %v", err)
 	}
 	// SS2022 and SOCKS5 on the same port.
 	doc = testBackupDoc()
 	doc.Inbounds[5].Port = 8389
-	if _, _, _, err := renderXrayConfig(doc, 10085); err == nil || !strings.Contains(err.Error(), "8389") {
+	if _, _, _, _, err := renderXrayConfig(doc, 10085, ""); err == nil || !strings.Contains(err.Error(), "8389") {
 		t.Fatalf("SS2022 and SOCKS on the same port should conflict, got %v", err)
 	}
 }
 
 // TestRenderSkippedUnchanged: slice 6 does not change the skip
-// rule — HY2/TUIC/AnyTLS/Trojan/VMess are still skipped (sing-box
-// core or a later slice), never rendered by the Xray side.
+// rule — HY2/TUIC/AnyTLS/VMess are still skipped (sing-box core),
+// never rendered by the Xray side. Trojan moved to the Xray side in
+// slice 7: without its certificate file it lands in needsCert, not
+// in skipped.
 func TestRenderSkippedUnchanged(t *testing.T) {
 	doc := &nodeConfig{OK: true, NodeID: 1, ConfigVersion: 1, Inbounds: []configInbound{
 		{InboundID: 1, InboundTag: "hy2-443", Protocol: "hysteria2", Transport: "quic", Security: "tls", Port: 443, Enabled: true},
@@ -643,11 +659,11 @@ func TestRenderSkippedUnchanged(t *testing.T) {
 		{InboundID: 4, InboundTag: "trojan-443", Protocol: "trojan", Transport: "tcp", Security: "tls", Port: 446, Enabled: true},
 		{InboundID: 5, InboundTag: "vmess-443", Protocol: "vmess", Transport: "tcp", Security: "none", Port: 447, Enabled: true},
 	}}
-	data, _, skipped, err := renderXrayConfig(doc, 10085)
+	data, _, skipped, needsCert, err := renderXrayConfig(doc, 10085, "")
 	if err != nil {
 		t.Fatalf("renderXrayConfig: %v", err)
 	}
-	want := []string{"anytls-443", "hy2-443", "trojan-443", "tuic-443", "vmess-443"}
+	want := []string{"anytls-443", "hy2-443", "tuic-443", "vmess-443"}
 	if len(skipped) != len(want) {
 		t.Fatalf("skipped = %v, want %v", skipped, want)
 	}
@@ -655,6 +671,9 @@ func TestRenderSkippedUnchanged(t *testing.T) {
 		if skipped[i] != w {
 			t.Fatalf("skipped = %v, want %v", skipped, want)
 		}
+	}
+	if len(needsCert) != 1 || needsCert[0] != "trojan-443" {
+		t.Fatalf("needsCert = %v, want [trojan-443]", needsCert)
 	}
 	p := parseXrayJSON(t, data)
 	if len(p.inbounds(t)) != 1 {
@@ -673,7 +692,7 @@ func TestValidateXrayConfigWithBackupProtocols(t *testing.T) {
 	if _, err := os.Stat(xrayBin); err != nil {
 		t.Skipf("no xray binary at %s", xrayBin)
 	}
-	data, _, _, err := renderXrayConfig(testBackupDoc(), 10085)
+	data, _, _, _, err := renderXrayConfig(testBackupDoc(), 10085, "")
 	if err != nil {
 		t.Fatalf("render: %v", err)
 	}

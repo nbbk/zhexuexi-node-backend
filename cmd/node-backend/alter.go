@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -106,15 +107,20 @@ type vlessTarget struct {
 
 // vlessTargets enumerates the VLESS inbounds a panel doc renders to,
 // reusing renderVLESSInbound so the hot path and the render path can
-// never disagree about which inbounds exist.
-func vlessTargets(nc *nodeConfig) ([]vlessTarget, error) {
+// never disagree about which inbounds exist. A TLS inbound whose
+// certificate is not on disk yet is skipped (errNeedCert), not an
+// error — there is no running inbound to hot-apply to.
+func vlessTargets(nc *nodeConfig, certsDir string) ([]vlessTarget, error) {
 	var targets []vlessTarget
 	for _, in := range nc.Inbounds {
 		if !in.Enabled || in.Protocol != "vless" {
 			continue
 		}
-		xb, skip, err := renderVLESSInbound(in, nil)
+		xb, skip, err := renderVLESSInbound(in, nil, certsDir)
 		if err != nil {
+			if skip && errors.Is(err, errNeedCert) {
+				continue
+			}
 			return nil, fmt.Errorf("inbound %s: %w", in.InboundTag, err)
 		}
 		if skip {

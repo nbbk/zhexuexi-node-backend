@@ -100,7 +100,7 @@ func TestEffectiveUsers(t *testing.T) {
 // TestVlessTargets: reality inbounds carry their flow, xhttp
 // inbounds carry none, non-VLESS inbounds are not targets.
 func TestVlessTargets(t *testing.T) {
-	targets, err := vlessTargets(testRealityDoc())
+	targets, err := vlessTargets(testRealityDoc(), "")
 	if err != nil {
 		t.Fatalf("vlessTargets: %v", err)
 	}
@@ -124,7 +124,7 @@ func TestVlessTargets(t *testing.T) {
 // whether the render carried users or not.
 func TestUsersAndStructureFromRendered(t *testing.T) {
 	doc := testRealityDoc()
-	data, _, _, err := renderXrayConfig(doc, 10085)
+	data, _, _, _, err := renderXrayConfig(doc, 10085, "")
 	if err != nil {
 		t.Fatalf("render: %v", err)
 	}
@@ -145,7 +145,7 @@ func TestUsersAndStructureFromRendered(t *testing.T) {
 		t.Fatalf("seeded reality-443 users wrong: %v", byInbound["reality-443"])
 	}
 	noUsers := &nodeConfig{OK: true, NodeID: 1, ConfigVersion: 2, Inbounds: doc.Inbounds}
-	emptyData, _, _, err := renderXrayConfig(noUsers, 10085)
+	emptyData, _, _, _, err := renderXrayConfig(noUsers, 10085, "")
 	if err != nil {
 		t.Fatalf("render without users: %v", err)
 	}
@@ -159,7 +159,7 @@ func TestUsersAndStructureFromRendered(t *testing.T) {
 	// A structural change (port) must change the structure SHA.
 	doc2 := testRealityDoc()
 	doc2.Inbounds[0].Port = 444
-	data2, _, _, err := renderXrayConfig(doc2, 10085)
+	data2, _, _, _, err := renderXrayConfig(doc2, 10085, "")
 	if err != nil {
 		t.Fatalf("render changed doc: %v", err)
 	}
@@ -251,7 +251,7 @@ func TestApplyUsersOnlyHotPath(t *testing.T) {
 		!strings.Contains(string(after), "99999999-8888-7777-6666-555555555555") {
 		t.Fatalf("xray.json after hot apply lacks the new/rotated user:\n%s", string(after))
 	}
-	want, _, _, err := renderXrayConfig(doc3, 10086)
+	want, _, _, _, err := renderXrayConfig(doc3, 10086, "")
 	if err != nil {
 		t.Fatalf("render doc3: %v", err)
 	}
@@ -313,7 +313,7 @@ func TestApplyIdenticalStartsStoppedXray(t *testing.T) {
 	defer sup.Stop()
 
 	doc := testRealityDoc()
-	data, _, _, err := renderXrayConfig(doc, 10085)
+	data, _, _, _, err := renderXrayConfig(doc, 10085, "")
 	if err != nil {
 		t.Fatalf("render: %v", err)
 	}
@@ -404,7 +404,7 @@ func TestPull304RestartsStaleDiskResyncsUsers(t *testing.T) {
 	// Disk: the v2 render (users A + B-old), as left by the last
 	// full apply before the hot applies.
 	diskDoc := testRealityDoc()
-	diskData, _, _, err := renderXrayConfig(diskDoc, 10085)
+	diskData, _, _, _, err := renderXrayConfig(diskDoc, 10085, "")
 	if err != nil {
 		t.Fatalf("render disk doc: %v", err)
 	}

@@ -499,7 +499,7 @@ func TestMTLS(t *testing.T) {
 
 // TestVersionConstant pins the version string sent to the panel.
 func TestVersionConstant(t *testing.T) {
-	if Version != "0.1.7" {
-		t.Errorf("Version = %q, want 0.1.7", Version)
+	if Version != "0.1.8" {
+		t.Errorf("Version = %q, want 0.1.8", Version)
 	}
 }

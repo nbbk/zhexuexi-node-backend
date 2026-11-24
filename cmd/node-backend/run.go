@@ -353,9 +353,13 @@ func checkCrossCoreTCPPorts(xrayJSON, singboxJSON []byte) error {
 // then start or restart the sing-box supervisor. A nil sbSup means
 // no sing-box management (Xray-only node or test). xrayData is the
 // freshly rendered Xray config, used for the cross-core TCP port
-// check. Any failure leaves the running sing-box untouched and the
-// next pull retries.
-func (a *configApplier) applySingbox(nc *nodeConfig, xrayData []byte) error {
+// check. certChanged reports that a certificate used by a sing-box
+// inbound changed on disk in this apply (slice 7 renewal): the
+// rendered config is byte-identical (it references certificate files
+// by path, not by content), so without this flag the SHA-equal
+// shortcut would leave the old certificate loaded. Any failure
+// leaves the running sing-box untouched and the next pull retries.
+func (a *configApplier) applySingbox(nc *nodeConfig, xrayData []byte, certChanged bool) error {
 	if a.sbSup == nil {
 		return nil
 	}
@@ -390,6 +394,18 @@ func (a *configApplier) applySingbox(nc *nodeConfig, xrayData []byte) error {
 			if a.sbSup.IsRunning() {
 				a.sbSup.Stop()
 				log.Printf("sing-box stopped (no sing-box inbounds left)")
+			}
+		} else if certChanged {
+			// The rendered config is byte-identical, but a
+			// certificate file it references changed on disk
+			// (slice 7 renewal): restart so the core re-reads it.
+			if a.sbSup.IsRunning() {
+				if err := a.sbSup.Restart(); err != nil {
+					return fmt.Errorf("restart sing-box: %w", err)
+				}
+				log.Printf("sing-box restarted (certificate renewed)")
+			} else if _, err := a.ensureSingboxRunning(); err != nil {
+				return err
 			}
 		} else if _, err := a.ensureSingboxRunning(); err != nil {
 			return err
@@ -512,18 +528,39 @@ func (a *configApplier) apply(nc *nodeConfig) error {
 //     via AlterInbound, then write the rendered config to disk so
 //     disk and running state agree; on AlterInbound failure (or
 //     when Xray is not running) fall back to the full path;
-//   - anything else changed: validate, write, start or restart Xray.
+//   - anything else changed — or a certificate used by an Xray TLS
+//     inbound changed on disk (slice 7 renewal, invisible to the
+//     structure SHA because the rendered config references the
+//     certificate file by path): validate, write, start or restart Xray.
 func (a *configApplier) applyInner(nc *nodeConfig) error {
-	data, sha, skipped, err := renderXrayConfig(nc, a.cfg.APIPort)
+	// Slice 7: certificates arrive with the config; write them to
+	// disk before rendering either core, so a newly delivered
+	// certificate is usable in this same apply. A sync failure
+	// aborts the apply (cores keep serving the old certificate).
+	changedCerts, err := a.syncCerts(nc)
+	if err != nil {
+		return fmt.Errorf("sync certificates: %w", err)
+	}
+	// A certificate content change does not change any rendered
+	// config (cores reference certificate files by path, not by
+	// content), so the SHA/structure comparisons below would miss
+	// it: a change to a ref used by a core's TLS inbounds forces
+	// that core's reload path instead.
+	xrayCertChanged := certChangeAffects(changedCerts, xrayTLSRefs(nc))
+	sbCertChanged := certChangeAffects(changedCerts, singboxTLSRefs(nc))
+	data, sha, skipped, needsCert, err := renderXrayConfig(nc, a.cfg.APIPort, a.certsDir())
 	if err != nil {
 		return fmt.Errorf("render xray config: %w", err)
 	}
 	for _, tag := range skipped {
 		log.Printf("inbound %s skipped: not an Xray inbound in this slice", tag)
 	}
+	for _, tag := range needsCert {
+		log.Printf("inbound %s skipped: certificate not on disk yet (slice 7 delivers certificates)", tag)
+	}
 	// Slice 5: sing-box applies first — a sing-box failure leaves
 	// Xray untouched and the next pull retries both cores together.
-	if err := a.applySingbox(nc, data); err != nil {
+	if err := a.applySingbox(nc, data, sbCertChanged); err != nil {
 		return err
 	}
 	newUsers := effectiveUsers(nc.Users)
@@ -531,7 +568,7 @@ func (a *configApplier) applyInner(nc *nodeConfig) error {
 	if err != nil {
 		return fmt.Errorf("structure sha: %w", err)
 	}
-	targets, err := vlessTargets(nc)
+	targets, err := vlessTargets(nc, a.certsDir())
 	if err != nil {
 		return fmt.Errorf("vless targets: %w", err)
 	}
@@ -547,7 +584,7 @@ func (a *configApplier) applyInner(nc *nodeConfig) error {
 	appliedByInbound := a.appliedByInbound
 	seeded = a.seeded
 	a.mu.Unlock()
-	if seeded && appliedStructure == structure {
+	if seeded && appliedStructure == structure && !xrayCertChanged {
 		tags := byInboundTags(appliedByInbound, newByInbound)
 		if byInboundSetsEqual(appliedByInbound, newByInbound, tags) {
 			if _, err := a.ensureXrayRunning(); err != nil {

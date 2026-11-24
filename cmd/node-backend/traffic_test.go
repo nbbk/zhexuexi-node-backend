@@ -47,7 +47,7 @@ func TestBuildReportContract(t *testing.T) {
 	sup := newSupervisor(cfg.XrayPath, cfg.XrayConfigPath)
 	ap := newConfigApplier(cfg, sup, nil)
 	users := effectiveUsers(testRealityDoc().Users)
-	targets, err := vlessTargets(testRealityDoc())
+	targets, err := vlessTargets(testRealityDoc(), "")
 	if err != nil {
 		t.Fatalf("vlessTargets: %v", err)
 	}

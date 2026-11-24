@@ -55,18 +55,29 @@ type configUser struct {
 	Inbounds  []string `json:"inbounds,omitempty"`
 }
 
-// nodeConfig is the body of GET /api/v1/node/config. Certs stay raw
-// JSON in slice 2: certificate issue and delivery is slice 7 work.
+// configCert is one panel-issued certificate from GET
+// /api/v1/node/config (slice 7): Ref matches the inbound CertRef,
+// Crt/Key are the PEM bodies. Only certificates referenced by this
+// node's TLS inbounds are included.
+type configCert struct {
+	Ref int64  `json:"ref"`
+	Crt string `json:"crt"`
+	Key string `json:"key"`
+}
+
+// nodeConfig is the body of GET /api/v1/node/config. Certs arrive
+// with the config in slice 7 (build plan §12 slice 7) and are
+// written to <config-dir>/certs/<ref>.crt/.key by syncCerts.
 type nodeConfig struct {
-	OK            bool              `json:"ok"`
-	NodeID        int               `json:"node_id"`
-	ConfigVersion int               `json:"config_version"`
-	ETag          string            `json:"etag"`
-	Deleted       bool              `json:"deleted"`
-	Inbounds      []configInbound   `json:"inbounds"`
-	Users         []configUser      `json:"users"`
-	Certs         []json.RawMessage `json:"certs"`
-	Error         string            `json:"error"`
+	OK            bool            `json:"ok"`
+	NodeID        int             `json:"node_id"`
+	ConfigVersion int             `json:"config_version"`
+	ETag          string          `json:"etag"`
+	Deleted       bool            `json:"deleted"`
+	Inbounds      []configInbound `json:"inbounds"`
+	Users         []configUser    `json:"users"`
+	Certs         []configCert    `json:"certs"`
+	Error         string          `json:"error"`
 }
 
 // pullStatus describes the outcome of one config pull.
