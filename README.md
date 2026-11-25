@@ -3,15 +3,20 @@
 轻量节点后端 agent：跑在落地机上的静态 Go 二进制。面板是唯一的事实
 来源；agent 只做节点拉取（60 秒 ETag），不做面板推送。
 
-切片 4（v0.1.4）：流量上报与计量（`QueryStats` 读 `user>>>`／
+当前版 v0.1.9（切片 11：一键安装脚本定稿，装 agent＋Xray-core
+v26.11.9＋sing-box 1.14.4 自编译版＋systemd＋入网；agent 监管
+Xray 与 sing-box 双核心）。
+
+切片 4 的功能：流量上报与计量（`QueryStats` 读 `user>>>`／
 `inbound>>>`、60 秒上报 `POST /api/v1/node/traffic`、本地 spool
 断线重放、健康上报随包）＋入站级指派（用户 `inbounds` 字段）
 ＋修 0.1.3 的删人静默失效 bug（判据改看内存已应用集，热应用
-后写盘）。sing-box 核心监管是后续切片的事，本版不含。
+后写盘）。
 
 ## 安装
 
-落地机上 root 执行（一键安装，装 agent 与 Xray-core v26.11.9）：
+落地机上 root 执行（一键安装，装 agent 与 Xray-core v26.11.9 与
+sing-box 1.14.4 自编译版）：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/nbbk/zhexuexi-node-backend/main/install-node-backend.sh \
@@ -38,18 +43,28 @@ DRY_RUN=1 ./install-node-backend.sh --panel https://example.com:11111 \
 ```
 
 安装脚本优先从 GitHub Release 下二进制
-（`releases/download/v0.1.4/node-backend-<amd64|arm64>`），下不到则
+（`releases/download/v0.1.9/node-backend-<amd64|arm64>`），下不到则
 改走源码编译兜底（`git clone` 仓库，缺 Go 时下载 Go 1.22.2 装到
-`/usr/local/go`，`CGO_ENABLED=0 go build`）。
+`/usr/local/go`，`CGO_ENABLED=0 go build`；兜底需要 git，缺了脚本
+会明说并停下）。同一次 Release 里还带 sing-box 自编译二进制
+（资产名 `sing-box-1.14.4-with-v2ray-api-<amd64|arm64>`，自编译
+1.14.4、带 V2Ray API，装到 `/usr/local/bin/sing-box`；已装且版本
+是 1.14.4 就跳过，装完校验版本，自检里再验一次）。
 
-> 注意：v0.1.4 的 Release 在推仓后才建，当前下载主路径会 404，
-> 这是预期的；此时脚本会自动走源码编译兜底。
+前置依赖：脚本在任何下载／安装之前先检查 curl、unzip、tar 与
+systemd（须 systemctl 在且 PID 1 是 systemd）。缺 curl／unzip／
+tar 时先按检测到的包管理器（按 apt-get／dnf／yum／apk 顺序取第一
+个找到的）自动装；装不上、或没检测到包管理器，就停下、不动任何
+东西，并一次性列出缺了什么与每样对应的安装命令（按检测到的包管理
+器给，能直接复制跑；检测不到包管理器就明说让用户用自家包管理器
+装）。缺 systemd 时直接停下并明说需要支持 systemd 的系统，不自动
+装、不做非 systemd 保活。脚本内部下载只用 curl，不加 wget 回退。
 
 ## 子命令
 
 ```bash
 node-backend version
-# node-backend 0.1.4
+# node-backend 0.1.9
 
 node-backend join --panel https://example.com:11111 \
   --token join_11111111111111111111111111111111 --node-id 1
@@ -73,7 +88,7 @@ node-backend run [--config-dir DIR] [--state-dir DIR]
 
 读配置，立即拉一次配置，之后每 60 秒拉一次
 （`GET /api/v1/node/config`，mTLS 出示入网证书，带
-`If-None-Match` 与 `X-Node-Backend-Version: 0.1.4`）：
+`If-None-Match` 与 `X-Node-Backend-Version: 0.1.9`）：
 
 - 200 非删除：把 `config_version` / `etag` / `last_pull` 写状态文件，
   再把配置渲染成 Xray 配置并应用（见下）；
@@ -97,7 +112,7 @@ node-backend run [--config-dir DIR] [--state-dir DIR]
   VLESS＋REALITY（＋Vision）、VLESS＋REALITY＋XHTTP（服务端）、
   api／stats／policy／dokodemo-door（127.0.0.1:10085）；
   REALITY 入站不写 `minClientVer`（第三方客户端版本不受限，0.1.2）；
-  HY2／TUIC 等非 Xray 入站跳过不渲染（sing-box 核心是后续切片的事）；
+  HY2／TUIC／AnyTLS 入站由 sing-box 渲染，不进 Xray 配置；
   TLS 入站没证书时报错（证书是切片 7 的事）。
   渲染前先 `xray run -test` 校验，校验不过不应用。
 - 监管：Xray 子进程被 kill 后 5 秒内拉起；连续 3 次 10 秒内退出
