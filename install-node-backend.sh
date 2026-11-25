@@ -88,6 +88,24 @@ run() {
   fi
 }
 
+# Version helpers. Never pipe a live "<binary> version" into head/grep:
+# head -1 / grep -q exit early and the producer then dies with SIGPIPE
+# (exit 141), which under "set -o pipefail" aborts the installer even
+# though the install succeeded. Capture the whole output first, then
+# work on the variable (no live pipe, no race).
+#   version_first_line <path> : print the first line of "<path> version".
+#   version_contains <path> <needle> : true if "<path> version" contains needle.
+version_first_line() {
+  local out
+  out="$("$1" version 2>/dev/null)" || return 1
+  printf '%s\n' "${out%%$'\n'*}"
+}
+version_contains() {
+  local out
+  out="$("$1" version 2>/dev/null)" || return 1
+  case "$out" in *"$2"*) return 0 ;; *) return 1 ;; esac
+}
+
 if [ "$DRY_RUN" != "1" ] && [ "$(id -u)" -ne 0 ]; then
   echo "must run as root (or set DRY_RUN=1 for a dry run)" >&2
   exit 1
@@ -237,7 +255,7 @@ fi
 if [ "$DRY_RUN" = "1" ]; then
   echo "[dry-run] download Xray-core v${XRAY_VERSION} (${XRAY_ASSET}) -> ${XRAY_PATH}"
 else
-  if [ -x "$XRAY_PATH" ] && "$XRAY_PATH" version 2>/dev/null | grep -q "Xray ${XRAY_VERSION}"; then
+  if [ -x "$XRAY_PATH" ] && version_contains "$XRAY_PATH" "Xray ${XRAY_VERSION}"; then
     echo "Xray-core v${XRAY_VERSION} already installed, skipping"
   else
     echo "==> downloading Xray-core v${XRAY_VERSION} (${XRAY_ASSET})"
@@ -246,7 +264,7 @@ else
     (cd "$TMP_XRAY" && unzip -o -q xray.zip xray)
     install -m 755 "${TMP_XRAY}/xray" "$XRAY_PATH"
     rm -rf "$TMP_XRAY"
-    echo "Xray-core installed: $("$XRAY_PATH" version | head -1)"
+    echo "Xray-core installed: $(version_first_line "$XRAY_PATH")"
   fi
 fi
 
@@ -257,7 +275,7 @@ fi
 if [ "$DRY_RUN" = "1" ]; then
   echo "[dry-run] download sing-box v${SINGBOX_VERSION} (${SINGBOX_ASSET}) -> ${SINGBOX_PATH}"
 else
-  if [ -x "$SINGBOX_PATH" ] && "$SINGBOX_PATH" version 2>/dev/null | grep -q "${SINGBOX_VERSION}"; then
+  if [ -x "$SINGBOX_PATH" ] && version_contains "$SINGBOX_PATH" "${SINGBOX_VERSION}"; then
     echo "sing-box v${SINGBOX_VERSION} already installed, skipping"
   else
     echo "==> downloading sing-box v${SINGBOX_VERSION} (${SINGBOX_ASSET})"
@@ -266,17 +284,17 @@ else
     chmod 755 "$TMP_SINGBOX"
     install -m 755 "$TMP_SINGBOX" "$SINGBOX_PATH"
     rm -f "$TMP_SINGBOX"
-    "$SINGBOX_PATH" version 2>/dev/null | grep -q "${SINGBOX_VERSION}" || {
+    version_contains "$SINGBOX_PATH" "${SINGBOX_VERSION}" || {
       echo "ERROR: sing-box version check failed after install (expected ${SINGBOX_VERSION})" >&2
       exit 1
     }
-    echo "sing-box installed: $("$SINGBOX_PATH" version | head -1)"
+    echo "sing-box installed: $(version_first_line "$SINGBOX_PATH")"
   fi
 fi
 
 # 2. Install the systemd unit. Prefer the copy shipped next to this
 #    script; otherwise write the embedded copy.
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-.}")" && pwd)"
 if [ "$DRY_RUN" = "1" ]; then
   echo "[dry-run] install systemd unit -> ${UNIT_PATH}"
   echo "[dry-run] mkdir -p ${CONFIG_DIR} ${STATE_DIR}"
@@ -331,14 +349,14 @@ if [ "$DRY_RUN" = "1" ]; then
   echo "[dry-run] self-check: xray version is ${XRAY_VERSION}"
 else
   echo "==> self-check: sing-box version"
-  "$SINGBOX_PATH" version | head -1
-  "$SINGBOX_PATH" version 2>/dev/null | grep -q "${SINGBOX_VERSION}" || {
+  version_first_line "$SINGBOX_PATH"
+  version_contains "$SINGBOX_PATH" "${SINGBOX_VERSION}" || {
     echo "ERROR: sing-box is not version ${SINGBOX_VERSION}" >&2
     exit 1
   }
   echo "==> self-check: xray version"
-  "$XRAY_PATH" version | head -1
-  "$XRAY_PATH" version 2>/dev/null | grep -q "Xray ${XRAY_VERSION}" || {
+  version_first_line "$XRAY_PATH"
+  version_contains "$XRAY_PATH" "Xray ${XRAY_VERSION}" || {
     echo "ERROR: xray is not version ${XRAY_VERSION}" >&2
     exit 1
   }
